@@ -1,0 +1,63 @@
+{
+  "name": "pi-vex",
+  "version": "0.1.0",
+  "description": "Fixed-role multi-agent coding orchestration for Pi",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jkesh/Vex.git"
+  },
+  "homepage": "https://github.com/jkesh/Vex#readme",
+  "bugs": {
+    "url": "https://github.com/jkesh/Vex/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "coding-agent",
+    "multi-agent",
+    "worktree",
+    "rag"
+  ],
+  "exports": {
+    ".": "./src/index.ts",
+    "./extension": "./extensions/vex/index.ts",
+    "./knowledge": "./src/knowledge.ts"
+  },
+  "files": [
+    "extensions",
+    "docs",
+    "roles",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/vex/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "check": "bun run typecheck && bun test",
+    "pack:check": "npm pack --dry-run"
+  },
+  "dependencies": {
+    "yaml": "^2.8.2"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@types/bun": "1.3.14",
+    "typescript": "^5.7.3",
+    "typebox": "^1.1.24"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "bun@1.3.14"
+}

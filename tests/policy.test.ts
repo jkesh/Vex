@@ -1,0 +1,38 @@
+import { describe, expect, test } from "bun:test";
+import { FileOwnershipPolicy } from "../src/policy.js";
+
+describe("FileOwnershipPolicy", () => {
+  const policy = new FileOwnershipPolicy();
+
+  test("blocks protected and cross-domain paths", () => {
+    const violations = policy.check(
+      "frontend",
+      ["server/api/users.ts", ".env.local"],
+      new Map(),
+    );
+    expect(violations.map((item) => item.rule)).toEqual([
+      "role-boundary",
+      "protected-path",
+    ]);
+  });
+
+  test("blocks two writer roles from owning the same file", () => {
+    const violations = policy.check(
+      "frontend",
+      ["package.json"],
+      new Map([["package.json", "backend"]]),
+    );
+    expect(violations).toHaveLength(1);
+    expect(violations[0]?.rule).toBe("cross-role-conflict");
+  });
+
+  test("allows test-engineer changes under test paths", () => {
+    expect(
+      policy.check(
+        "test-engineer",
+        ["tests/api.test.ts", "src/__tests__/unit.spec.ts"],
+        new Map(),
+      ),
+    ).toEqual([]);
+  });
+});
