@@ -200,6 +200,9 @@ describe("standalone CLI argument parser", () => {
     ]);
     expect(complete("/login")[0]).toEqual([]);
     expect(interactiveHelp()).toContain("/provider [id] [oauth|api-key]");
+    expect(interactiveHelp()).toContain(
+      "assign models to targets repeatedly; Esc finishes",
+    );
     expect(interactiveHelp()).not.toContain("/login");
     expect(complete("/model cla")[0]).toEqual(["/model claude-sonnet"]);
     expect(complete("/route architect anth")[0]).toEqual([
@@ -228,6 +231,10 @@ describe("standalone CLI argument parser", () => {
       "/run",
       "/help",
     ]);
+    expect(hints("/mode")[0]).toEqual({
+      value: "/mode ",
+      description: "select auto, chat, review, or implement",
+    });
     expect(hints("/provider an")[0]).toEqual({
       value: "/provider anthropic ",
       description: "Claude (Anthropic) Provider",

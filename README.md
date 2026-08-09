@@ -26,7 +26,7 @@ Running `vex` without arguments opens a direct natural-language session. There i
 › 修复登录接口，并补充回归测试
 ```
 
-Plain text enters `auto` mode; no numbered action menu is required. Clear implementation requests start the existing plan/implementation workflow, review-only requests launch a read-only Scout and Technical Reviewer, and conversational questions receive a direct answer without workspace access. `/mode auto|chat|review|implement` overrides routing for later prompts. Typing `/` opens a live, filtered command panel with a short explanation for every command; Up/Down changes the highlighted suggestion and Tab completes it. The same panel suggests known Providers, modes, roles, authentication methods, and discovered models while arguments are typed. `/provider` is the single Provider selection and authentication command. `/model` opens a full-screen selector with Providers on the left and that Provider's models on the right. Click either pane with the mouse, use the mouse wheel to scroll, or use Left/Right, Up/Down, typing, Enter, and Esc. After choosing a model, VEX asks whether it should become the session default or route one fixed Agent role.
+Plain text enters `auto` mode; no numbered action menu is required. Clear implementation requests start the existing plan/implementation workflow, review-only requests launch a read-only Scout and Technical Reviewer, and conversational questions receive a direct answer without workspace access. `/mode auto|chat|review|implement` overrides routing for later prompts. Typing `/` opens a live, filtered command panel with a short explanation for every command; Up/Down changes the highlighted suggestion and Tab completes it. The same panel suggests known Providers, modes, roles, authentication methods, and discovered models while arguments are typed. `/provider` is the single Provider selection and authentication command. `/model` opens a full-screen selector with Providers on the left and that Provider's models on the right. Click either pane with the mouse, use the mouse wheel to scroll, or use Left/Right, Up/Down, typing, Enter, and Esc. After assigning a model to the session default or an Agent role, VEX saves the route immediately and returns to the model selector. Repeat for additional roles, then press Esc to finish and return to the prompt.
 
 ## Install and run locally
 
@@ -197,8 +197,8 @@ Interactive routing can be changed without editing the file:
 /provider                        select a Provider; authenticate when required
 /provider openai oauth           ChatGPT browser OAuth; no API key entry
 /provider openai api-key         paste an existing OpenAI API key
-/model [query]                   Provider | model picker, then target role
-/route                           Provider | model picker, then Agent role
+/model [query]                   repeatedly choose model and target; Esc finishes
+/route                           repeatedly choose model and Agent role; Esc finishes
 /route architect openai reasoning-model   direct form
 /routing
 ```

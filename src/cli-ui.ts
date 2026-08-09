@@ -244,20 +244,22 @@ function hintRows(
   hints: readonly LineHint[],
   activeHint: number,
 ): string[] {
+  const rowWidth = Math.max(10, (stdout.columns ?? 80) - 1);
+  const fit = (rows: string[]) => rows.map((row) => crop(row, rowWidth));
   if (!lineValue) {
-    return [
+    return fit([
       `${ansi.dim}  Hint: type / to view commands · Tab completes parameters${ansi.reset}`,
-    ];
+    ]);
   }
   if (!lineValue.trimStart().startsWith("/")) return [];
   if (hints.length === 0) {
-    return /\s/.test(lineValue.trimStart())
+    return fit(/\s/.test(lineValue.trimStart())
       ? [
           `${ansi.dim}  No known parameter suggestions · keep typing or press Enter${ansi.reset}`,
         ]
       : [
           `${ansi.yellow}  No matching command${ansi.reset}  ${ansi.dim}Use /help to list commands${ansi.reset}`,
-        ];
+        ]);
   }
 
   const maxVisible = Math.max(
@@ -274,20 +276,19 @@ function hintRows(
       : "";
     return crop(
       `  ${marker} ${value}${detail}`,
-      Math.max(40, (stdout.columns ?? 80) - 1),
+      rowWidth,
     );
   });
   lines.push(
     `${ansi.dim}  ${hints.length} suggestion${hints.length === 1 ? "" : "s"} · ↑/↓ choose · Tab complete · Enter run${ansi.reset}`,
   );
-  return lines;
+  return fit(lines);
 }
 
 async function readHintedLine(
   prompt: string,
   hintProvider: LineHintProvider,
 ): Promise<string> {
-  const wasPaused = stdin.isPaused();
   const wasRaw = stdin.isRaw;
   emitKeypressEvents(stdin);
   stdin.setRawMode(true);
@@ -338,7 +339,7 @@ async function readHintedLine(
       stdin.off("keypress", onKeypress);
       stdout.off("resize", scheduleRender);
       stdin.setRawMode(Boolean(wasRaw));
-      if (wasPaused) stdin.pause();
+      stdin.pause();
       stdout.write("\x1b[?25h");
     };
     const finish = (submitted: string, interrupted = false) => {
@@ -702,6 +703,11 @@ export interface ProviderModelTargetSelection<T, U> {
   target: U;
 }
 
+export interface ProviderModelTargetBehavior<T, U> {
+  continueAfterAssign?: boolean;
+  onAssign?(selection: ProviderModelTargetSelection<T, U>): string | void;
+}
+
 export interface SgrMouseEvent {
   button: number;
   column: number;
@@ -732,24 +738,33 @@ async function selectProviderModelFlow<T, U>(
   providers: readonly ProviderModelPane<T>[],
   options: ProviderModelSelectOptions<T> = {},
   followup?: FollowupSelectOptions<U>,
+  targetBehavior?: ProviderModelTargetBehavior<T, U>,
 ): Promise<T | ProviderModelTargetSelection<T, U> | undefined> {
   if (providers.length === 0) return undefined;
   if (!stdin.isTTY || !stdout.isTTY || typeof stdin.setRawMode !== "function") {
-    const model = await selectFromNumberedList(
-      title,
-      providers.flatMap((provider) =>
-        provider.models.map((model): SelectItem<T> => ({
-          ...model,
-          label: `${provider.label} / ${model.label}`,
-          description: [model.description, provider.description]
-            .filter(Boolean)
-            .join(" · "),
-        }))
-      ),
-    );
-    if (model === undefined || !followup) return model;
-    const target = await selectFromNumberedList(followup.title, followup.items);
-    return target === undefined ? undefined : { model, target };
+    while (true) {
+      const model = await selectFromNumberedList(
+        title,
+        providers.flatMap((provider) =>
+          provider.models.map((model): SelectItem<T> => ({
+            ...model,
+            label: `${provider.label} / ${model.label}`,
+            description: [model.description, provider.description]
+              .filter(Boolean)
+              .join(" · "),
+          }))
+        ),
+      );
+      if (model === undefined || !followup) return model;
+      const target = await selectFromNumberedList(followup.title, followup.items);
+      if (target === undefined) {
+        if (targetBehavior?.continueAfterAssign) continue;
+        return undefined;
+      }
+      const selection = { model, target };
+      targetBehavior?.onAssign?.(selection);
+      if (!targetBehavior?.continueAfterAssign) return selection;
+    }
   }
 
   const wasPaused = stdin.isPaused();
@@ -781,6 +796,8 @@ async function selectProviderModelFlow<T, U>(
     let step: "models" | "followup" = "models";
     let chosenModel: SelectItem<T> | undefined;
     let chosenProviderLabel = "";
+    let lastAssignment = "";
+    const assignedTargets = new Set<U>();
     let targetIndex = Math.max(
       0,
       followup?.items.findIndex((item) =>
@@ -833,7 +850,7 @@ async function selectProviderModelFlow<T, U>(
           const index = targetStart + offset;
           const item = followup.items[index];
           const targetText = item
-            ? `${index === targetIndex ? ">" : " "} ${item.label}${item.description ? ` · ${item.description}` : ""}`
+            ? `${index === targetIndex ? ">" : " "} ${assignedTargets.has(item.value) ? "✓ " : ""}${item.label}${item.description ? ` · ${item.description}` : ""}`
             : offset === 0 && followup.items.length === 0
               ? `  ${followup.emptyMessage ?? "No target roles"}`
               : "";
@@ -843,7 +860,10 @@ async function selectProviderModelFlow<T, U>(
         }
         lines.push(
           `└${"─".repeat(contentWidth)}┘`,
-          `${ansi.dim}Mouse: click a role · Keyboard: ↑/↓ move · Enter assign · Esc back${ansi.reset}`,
+          crop(
+            `${ansi.dim}↑/↓ move · Enter assign${targetBehavior?.continueAfterAssign ? " and continue" : ""} · Esc back · mouse enabled${ansi.reset}`,
+            terminalWidth,
+          ),
         );
         stdout.write(`\x1b[H\x1b[2J${lines.join("\n")}`);
         return;
@@ -894,9 +914,20 @@ async function selectProviderModelFlow<T, U>(
           )}│`,
         );
       }
+      lines.push(`└${"─".repeat(providerWidth)}┴${"─".repeat(modelWidth)}┘`);
+      if (lastAssignment) {
+        lines.push(
+          crop(
+            `${ansi.green}✓ ${lastAssignment}${ansi.reset} · choose another model or press Esc to finish`,
+            terminalWidth,
+          ),
+        );
+      }
       lines.push(
-        `└${"─".repeat(providerWidth)}┴${"─".repeat(modelWidth)}┘`,
-        `${ansi.dim}Mouse: click Provider or model · Keyboard: ←/→ pane · ↑/↓ move · type search · Enter select · Esc cancel${ansi.reset}`,
+        crop(
+          `${ansi.dim}←/→ pane · ↑/↓ move · type search · Enter select · Esc ${targetBehavior?.continueAfterAssign ? "done" : "cancel"} · mouse enabled${ansi.reset}`,
+          terminalWidth,
+        ),
       );
       stdout.write(`\x1b[H\x1b[2J${lines.join("\n")}`);
     };
@@ -930,7 +961,24 @@ async function selectProviderModelFlow<T, U>(
     const acceptTarget = () => {
       const target = followup?.items[targetIndex];
       if (chosenModel && target) {
-        finish({ model: chosenModel.value, target: target.value });
+        const selection = { model: chosenModel.value, target: target.value };
+        const selectedModelLabel = `${chosenProviderLabel} / ${chosenModel.label}`;
+        const notice = targetBehavior?.onAssign?.(selection);
+        if (!targetBehavior?.continueAfterAssign) {
+          finish(selection);
+          return;
+        }
+        assignedTargets.add(target.value);
+        lastAssignment = typeof notice === "string" && notice
+          ? notice
+          : `${target.label} ← ${selectedModelLabel}`;
+        targetIndex = followup && followup.items.length > 0
+          ? (targetIndex + 1) % followup.items.length
+          : 0;
+        chosenModel = undefined;
+        chosenProviderLabel = "";
+        pane = "models";
+        step = "models";
       }
     };
     const moveProvider = (delta: number) => {
@@ -1078,6 +1126,7 @@ async function selectProviderModelFlow<T, U>(
         if (followup?.items[index]) {
           targetIndex = index;
           acceptTarget();
+          if (!finished) render();
         }
         return;
       }
@@ -1134,12 +1183,14 @@ export async function selectProviderModelAndTarget<T, U>(
   providers: readonly ProviderModelPane<T>[],
   followup: FollowupSelectOptions<U>,
   options: ProviderModelSelectOptions<T> = {},
+  targetBehavior?: ProviderModelTargetBehavior<T, U>,
 ): Promise<ProviderModelTargetSelection<T, U> | undefined> {
   return await selectProviderModelFlow(
     title,
     providers,
     options,
     followup,
+    targetBehavior,
   ) as ProviderModelTargetSelection<T, U> | undefined;
 }
 

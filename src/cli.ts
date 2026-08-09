@@ -357,9 +357,9 @@ Type / for live command hints. Use Up/Down to choose and Tab to complete command
   /provider [id] [oauth|api-key]
                      select a Provider and connect it when required
   /logout [provider] select and remove a saved login
-  /model [query]     select a model, then choose its target role
+  /model [query]     assign models to targets repeatedly; Esc finishes
   /route [role] [provider] [model]
-                     choose model then role, or set an explicit route
+                     repeatedly choose model then role, or set one explicitly
   /routing           show current session routing
   /init [--global]   create VEX configuration
   /clear             redraw the coding session
@@ -397,9 +397,9 @@ const INTERACTIVE_COMMAND_COMPLETIONS = [
 
 const INTERACTIVE_COMMAND_DESCRIPTIONS: Record<string, string> = {
   "/provider": "choose a Provider and authenticate when required",
-  "/model": "choose a Provider/model, then assign its target role",
+  "/model": "assign Provider/models to targets; Esc when done",
   "/mode": "select auto, chat, review, or implement",
-  "/route": "assign a Provider/model to one Agent role",
+  "/route": "assign Provider/models to Agent roles; Esc when done",
   "/chat": "one pure conversation turn without workspace tools",
   "/assess": "one read-only technical review",
   "/auto": "classify one prompt and choose its work mode",
@@ -584,7 +584,11 @@ export function createInteractiveHintProvider(
       candidates.sort((left, right) => {
         const leftCommand = left.trimEnd();
         const rightCommand = right.trimEnd();
-        return (priority.get(leftCommand) ?? Number.MAX_SAFE_INTEGER) -
+        const normalizedValue = value.toLowerCase();
+        const leftExact = leftCommand.toLowerCase() === normalizedValue;
+        const rightExact = rightCommand.toLowerCase() === normalizedValue;
+        return Number(rightExact) - Number(leftExact) ||
+          (priority.get(leftCommand) ?? Number.MAX_SAFE_INTEGER) -
             (priority.get(rightCommand) ?? Number.MAX_SAFE_INTEGER) ||
           left.localeCompare(right);
       });
@@ -1103,6 +1107,10 @@ interface ChooseModelOptions {
   initialModel?: string;
   initialQuery?: string;
   targetMode?: ModelTargetMode;
+  continueAfterTargetAssignment?: boolean;
+  onTargetAssigned?(
+    selection: SelectedModel & { target: ModelTarget },
+  ): string | void;
   onCatalogs?(catalogs: readonly ProviderModelCatalog[]): void;
 }
 
@@ -1236,6 +1244,21 @@ async function chooseModel(
   };
   if (options.targetMode) {
     const includeSessionDefault = options.targetMode === "session-or-role";
+    const targetBehavior = options.continueAfterTargetAssignment ||
+        options.onTargetAssigned
+      ? {
+          continueAfterAssign: options.continueAfterTargetAssignment ?? false,
+          onAssign(selection: {
+            model: SelectedModel;
+            target: ModelTarget;
+          }) {
+            return options.onTargetAssigned?.({
+              ...selection.model,
+              target: selection.target,
+            });
+          },
+        }
+      : undefined;
     const selected = await selectProviderModelAndTarget<SelectedModel, ModelTarget>(
       pickerTitle,
       panes,
@@ -1249,6 +1272,7 @@ async function chooseModel(
           : MODEL_ROLES[0],
       },
       pickerOptions,
+      targetBehavior,
     );
     return selected
       ? { ...selected.model, target: selected.target }
@@ -1272,6 +1296,39 @@ function applySelectedModel(
     model: selected.model,
   };
   return `${target} routed to ${selected.provider}/${selected.model}`;
+}
+
+async function configureModelRoutes(
+  runtime: Runtime,
+  cwd: string,
+  routing: InteractiveRoutingState,
+  options: ChooseModelOptions & { targetMode: ModelTargetMode },
+): Promise<string[]> {
+  const updates: string[] = [];
+  const selected = await chooseModel(runtime, cwd, {
+    ...options,
+    continueAfterTargetAssignment: true,
+    onTargetAssigned(assignment) {
+      const message = applySelectedModel(
+        routing,
+        assignment,
+        assignment.target,
+      );
+      updates.push(message);
+      return message;
+    },
+  });
+  if (selected?.target) {
+    updates.push(applySelectedModel(routing, selected, selected.target));
+  }
+  return updates;
+}
+
+function writeModelRouteUpdates(updates: readonly string[]): void {
+  if (updates.length === 0) return;
+  process.stdout.write(
+    `Model routing updated:\n${updates.map((update) => `  ${update}`).join("\n")}\n`,
+  );
 }
 
 async function chooseRole(initial?: string): Promise<ModelRole | undefined> {
@@ -1459,17 +1516,14 @@ async function interactive(runtime: Runtime, cwd: string): Promise<void> {
     }
     if (action.kind === "set-model") {
       try {
-        const selected = await chooseModel(runtime, cwd, {
+        const updates = await configureModelRoutes(runtime, cwd, routing, {
           ...(routing.provider ? { initialProvider: routing.provider } : {}),
           ...(routing.model ? { initialModel: routing.model } : {}),
           ...(action.model ? { initialQuery: action.model } : {}),
           targetMode: "session-or-role",
           onCatalogs: rememberCatalogs,
         });
-        if (!selected?.target) continue;
-        process.stdout.write(
-          `${applySelectedModel(routing, selected, selected.target)}\n`,
-        );
+        writeModelRouteUpdates(updates);
       } catch (error) {
         process.stdout.write(
           `VEX: ${error instanceof Error ? error.message : String(error)}\n`,
@@ -1480,18 +1534,13 @@ async function interactive(runtime: Runtime, cwd: string): Promise<void> {
     if (action.kind === "set-route") {
       try {
         if (!action.role && !action.provider && !action.model) {
-          const selected = await chooseModel(runtime, cwd, {
+          const updates = await configureModelRoutes(runtime, cwd, routing, {
             ...(routing.provider ? { initialProvider: routing.provider } : {}),
             ...(routing.model ? { initialModel: routing.model } : {}),
             targetMode: "role-only",
             onCatalogs: rememberCatalogs,
           });
-          if (!selected?.target || selected.target === "session-default") {
-            continue;
-          }
-          process.stdout.write(
-            `${applySelectedModel(routing, selected, selected.target)}\n`,
-          );
+          writeModelRouteUpdates(updates);
           continue;
         }
         const role = action.role
@@ -1551,7 +1600,7 @@ async function interactive(runtime: Runtime, cwd: string): Promise<void> {
         continue;
       }
       if (action.invocation.command === "models") {
-        const selected = await chooseModel(runtime, cwd, {
+        const updates = await configureModelRoutes(runtime, cwd, routing, {
           ...(action.invocation.values[0]
             ? { requestedProvider: action.invocation.values[0] }
             : {}),
@@ -1560,11 +1609,7 @@ async function interactive(runtime: Runtime, cwd: string): Promise<void> {
           targetMode: "session-or-role",
           onCatalogs: rememberCatalogs,
         });
-        if (selected?.target) {
-          process.stdout.write(
-            `${applySelectedModel(routing, selected, selected.target)}\n`,
-          );
-        }
+        writeModelRouteUpdates(updates);
         continue;
       }
       await execute(
