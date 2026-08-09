@@ -35,4 +35,23 @@ describe("FileOwnershipPolicy", () => {
       ),
     ).toEqual([]);
   });
+
+  test("enforces manifest-owned paths including glob patterns", () => {
+    expect(
+      policy.check(
+        "backend",
+        ["src/server.ts"],
+        new Map(),
+        ["src/**"],
+      ),
+    ).toEqual([]);
+    expect(
+      policy.check(
+        "backend",
+        ["package.json"],
+        new Map(),
+        ["src/**"],
+      )[0]?.rule,
+    ).toBe("assignment-boundary");
+  });
 });

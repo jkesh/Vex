@@ -10,5 +10,5 @@
     "noEmit": true,
     "types": ["bun", "node"]
   },
-  "include": ["extensions/**/*.ts", "src/**/*.ts", "tests/**/*.ts"]
+  "include": ["src/**/*.ts", "tests/**/*.ts"]
 }

@@ -1,6 +1,13 @@
-import { spawn, type ChildProcess } from "node:child_process";
-import { access, mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { NativeAgentToolExecutor, toolDefinitions } from "./agent-tools.js";
+import { vexFetch } from "./http-client.js";
+import {
+  completeProvider,
+  type ProviderAuthResolver,
+  type ProviderFetchLike,
+  type ProviderMessage,
+} from "./provider-transport.js";
 import {
   MODEL_ROLES,
   type RoleRunInput,
@@ -8,82 +15,13 @@ import {
   type RoleYield,
 } from "./types.js";
 
-export const TEAM_YIELD_MARKER = "VEX_TEAM_YIELD:";
-
-export interface PiChildRunnerOptions {
-  extensionPath: string;
-  command?: string;
-  commandArguments?: string[];
-  environment?: NodeJS.ProcessEnv;
-}
-
-interface PiEventMessage {
-  role?: string;
-  toolName?: string;
-  content?: Array<{ type?: string; text?: string }>;
-}
-
-function textFromMessage(message: PiEventMessage | undefined): string {
-  return (message?.content ?? [])
-    .filter((part) => part.type === "text" && typeof part.text === "string")
-    .map((part) => part.text)
-    .join("\n");
-}
-
-export function parseTeamYield(text: string): RoleYield | undefined {
-  const marker = text.lastIndexOf(TEAM_YIELD_MARKER);
-  if (marker < 0) return undefined;
-  const candidate = text.slice(marker + TEAM_YIELD_MARKER.length).trim();
-  try {
-    const parsed = JSON.parse(candidate) as RoleYield;
-    if (
-      !MODEL_ROLES.includes(parsed.role) ||
-      !["completed", "skipped", "blocked", "failed"].includes(parsed.status) ||
-      typeof parsed.summary !== "string" ||
-      parsed.summary.length === 0 ||
-      !Array.isArray(parsed.artifacts) ||
-      !parsed.artifacts.every((artifact) => typeof artifact === "string")
-    ) {
-      return undefined;
-    }
-    return parsed;
-  } catch {
-    return undefined;
-  }
-}
-
-async function commandExists(filePath: string): Promise<boolean> {
-  try {
-    await access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-export async function resolvePiInvocation(
-  options: PiChildRunnerOptions,
-): Promise<{ command: string; args: string[] }> {
-  if (options.command)
-    return { command: options.command, args: options.commandArguments ?? [] };
-
-  const currentScript = process.argv[1];
-  if (
-    currentScript &&
-    /(?:^|[\\/])dist[\\/](?:bun[\\/])?cli\.js$/i.test(currentScript) &&
-    (await commandExists(currentScript))
-  ) {
-    return { command: process.execPath, args: [currentScript] };
-  }
-  const executableName = path.basename(process.execPath).toLowerCase();
-  if (!/^(?:node|bun)(?:\.exe)?$/.test(executableName))
-    return { command: process.execPath, args: [] };
-  return { command: "pi", args: [] };
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function compactContext(
   value: Record<string, unknown>,
-  maxCharacters = 24_000,
+  maxCharacters = 32_000,
 ): string {
   const json = JSON.stringify(value, null, 2);
   return json.length <= maxCharacters
@@ -91,7 +29,7 @@ function compactContext(
     : `${json.slice(0, maxCharacters)}\n... context truncated by VEX`;
 }
 
-function buildSystemPrompt(input: RoleRunInput): string {
+function systemPrompt(input: RoleRunInput): string {
   const knowledge = input.knowledge.length
     ? input.knowledge
         .map((document, index) => {
@@ -100,153 +38,247 @@ function buildSystemPrompt(input: RoleRunInput): string {
         })
         .join("\n\n")
     : "No external role knowledge was returned.";
-
-  return `${input.role.systemPrompt}\n\n## VEX Run\nRun: ${input.runId}\nRole: ${input.role.name}\nWorktree: ${input.cwd}\n\n## Role Knowledge\n${knowledge}`;
+  return `${input.role.systemPrompt}\n\n## VEX Runtime\nRun: ${input.runId}\nRole: ${input.role.name}\nModel: ${input.runtime.model}\nThinking: ${input.runtime.thinking}\nWorktree: ${input.cwd}\n\n## Role Knowledge\n${knowledge}\n\nYou are running inside VEX's native agent runtime. Use only the supplied tools. Never invent tool results. Finish exactly once with team_yield.`;
 }
 
-export class PiChildRunner {
-  readonly #options: PiChildRunnerOptions;
+function userPrompt(input: RoleRunInput): string {
+  return `Task: ${input.task}\n\nVEX context:\n${compactContext(input.context)}`;
+}
 
-  constructor(options: PiChildRunnerOptions) {
-    this.#options = options;
+export function parseRoleYield(
+  value: unknown,
+  expectedRole?: RoleRunInput["role"]["name"],
+): RoleYield | undefined {
+  if (!isRecord(value)) return undefined;
+  const role = value.role;
+  const status = value.status;
+  if (
+    typeof role !== "string" ||
+    !MODEL_ROLES.includes(role as RoleYield["role"]) ||
+    (expectedRole && role !== expectedRole) ||
+    typeof status !== "string" ||
+    !["completed", "skipped", "blocked", "failed"].includes(status) ||
+    typeof value.summary !== "string" ||
+    !value.summary.trim() ||
+    !Array.isArray(value.artifacts) ||
+    value.artifacts.some((artifact) => typeof artifact !== "string")
+  ) {
+    return undefined;
+  }
+  return {
+    role: role as RoleYield["role"],
+    status: status as RoleYield["status"],
+    summary: value.summary,
+    artifacts: value.artifacts as string[],
+    ...(value.payload !== undefined ? { payload: value.payload } : {}),
+  };
+}
+
+async function loadSession(filePath: string): Promise<ProviderMessage[]> {
+  try {
+    const parsed = JSON.parse(await readFile(filePath, "utf8")) as unknown;
+    return Array.isArray(parsed) ? (parsed as ProviderMessage[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveSession(
+  filePath: string,
+  messages: ProviderMessage[],
+): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const temporary = `${filePath}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(messages, null, 2)}\n`, "utf8");
+  await rename(temporary, filePath);
+}
+
+function compactSession(messages: ProviderMessage[], limit = 80): void {
+  if (messages.length <= limit + 1) return;
+  const system = messages[0]!;
+  const tail = messages.slice(-limit);
+  while (tail[0]?.role === "tool") tail.shift();
+  messages.splice(
+    0,
+    messages.length,
+    system,
+    {
+      role: "user",
+      content:
+        "VEX truncated older session messages. Continue from the recent tool history and current assignment context.",
+    },
+    ...tail,
+  );
+}
+
+function failure(
+  input: RoleRunInput,
+  summary: string,
+  rawOutput: string,
+): RoleRunResult {
+  return {
+    role: input.role.name,
+    exitCode: 1,
+    yield: {
+      role: input.role.name,
+      status: "failed",
+      summary,
+      artifacts: [],
+    },
+    stderr: summary,
+    rawOutput,
+  };
+}
+
+export interface NativeAgentRunnerOptions {
+  environment?: NodeJS.ProcessEnv;
+  fetch?: FetchLike;
+  tools?: NativeAgentToolExecutor;
+  auth?: ProviderAuthResolver;
+}
+
+export type FetchLike = ProviderFetchLike;
+
+export class NativeAgentRunner {
+  readonly #environment: NodeJS.ProcessEnv;
+  readonly #fetch: FetchLike;
+  readonly #tools: NativeAgentToolExecutor;
+  readonly #auth?: NativeAgentRunnerOptions["auth"];
+
+  constructor(options: NativeAgentRunnerOptions = {}) {
+    this.#environment = options.environment ?? process.env;
+    this.#fetch = options.fetch ?? vexFetch;
+    this.#tools = options.tools ?? new NativeAgentToolExecutor();
+    this.#auth = options.auth;
   }
 
   async run(input: RoleRunInput, signal?: AbortSignal): Promise<RoleRunResult> {
-    const promptDirectory = path.join(
-      input.context.runDirectory as string,
-      "prompts",
-    );
-    await mkdir(promptDirectory, { recursive: true });
-    const promptPath = path.join(promptDirectory, `${input.role.name}.md`);
-    await writeFile(promptPath, `${buildSystemPrompt(input)}\n`, "utf8");
-
-    const invocation = await resolvePiInvocation(this.#options);
-    const args = [
-      ...invocation.args,
-      "--mode",
-      "json",
-      "-p",
-      "--no-session",
-      "--no-extensions",
-      "--no-skills",
-      "--no-prompt-templates",
-      "--extension",
-      this.#options.extensionPath,
-      "--tools",
-      input.role.tools.join(","),
-      "--append-system-prompt",
-      promptPath,
-      `Task: ${input.task}\n\nVEX context:\n${compactContext(input.context)}`,
-    ];
-
-    return new Promise<RoleRunResult>((resolve, reject) => {
-      const child = spawn(invocation.command, args, {
-        cwd: input.cwd,
-        env: {
-          ...process.env,
-          ...this.#options.environment,
-          VEX_CHILD: "1",
-          VEX_RUN_ID: input.runId,
-          VEX_ROLE: input.role.name,
-        },
-        shell: false,
-        windowsHide: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-
-      this.#collect(child, input, signal).then(resolve, reject);
-    });
-  }
-
-  async #collect(
-    child: ChildProcess,
-    input: RoleRunInput,
-    signal?: AbortSignal,
-  ): Promise<RoleRunResult> {
-    let stdoutBuffer = "";
-    let rawOutput = "";
-    let stderr = "";
-    let roleYield: RoleYield | undefined;
-    let finalText = "";
-    let aborted = false;
-
-    const processLine = (line: string) => {
-      if (!line.trim()) return;
-      rawOutput += `${line}\n`;
-      try {
-        const event = JSON.parse(line) as {
-          type?: string;
-          message?: PiEventMessage;
-        };
-        const text = textFromMessage(event.message);
-        if (
-          event.type === "message_end" &&
-          event.message?.role === "assistant" &&
-          text
-        )
-          finalText = text;
-        if (
-          event.type === "tool_result_end" &&
-          event.message?.toolName === "team_yield"
-        ) {
-          roleYield = parseTeamYield(text) ?? roleYield;
-        }
-      } catch {
-        // Pi JSON mode can include diagnostics; retain them in rawOutput.
-      }
-    };
-
-    if (!child.stdout || !child.stderr)
-      throw new Error("Pi child process has no output streams");
-    child.stdout.on("data", (data: Buffer) => {
-      stdoutBuffer += data.toString("utf8");
-      const lines = stdoutBuffer.split(/\r?\n/);
-      stdoutBuffer = lines.pop() ?? "";
-      for (const line of lines) processLine(line);
-    });
-    child.stderr.on("data", (data: Buffer) => {
-      stderr += data.toString("utf8");
-    });
-
-    const abort = () => {
-      aborted = true;
-      child.kill("SIGTERM");
-      const forceKill = setTimeout(() => {
-        if (child.exitCode === null) child.kill("SIGKILL");
-      }, 5_000);
-      forceKill.unref();
-    };
-    if (signal?.aborted) abort();
-    else signal?.addEventListener("abort", abort, { once: true });
-
-    const exitCode = await new Promise<number>((resolve, reject) => {
-      child.once("error", reject);
-      child.once("close", (code) => resolve(code ?? 1));
-    });
-    signal?.removeEventListener("abort", abort);
-    if (stdoutBuffer.trim()) processLine(stdoutBuffer);
-
-    const resultYield: RoleYield = roleYield ?? {
-      role: input.role.name,
-      status: "failed",
-      summary: aborted
-        ? "Pi child was aborted before returning team_yield"
-        : finalText ||
-          stderr.trim() ||
-          `Pi child exited with code ${exitCode} without team_yield`,
-      artifacts: [],
-    };
-    if (resultYield.role !== input.role.name) {
-      resultYield.status = "failed";
-      resultYield.summary = `Role mismatch: expected ${input.role.name}, received ${resultYield.role}`;
+    const runDirectory = input.context.runDirectory;
+    if (typeof runDirectory !== "string" || !runDirectory) {
+      throw new Error("Role context is missing runDirectory");
     }
-
-    return {
-      role: input.role.name,
-      exitCode,
-      yield: resultYield,
-      stderr,
-      rawOutput,
-    };
+    const promptDirectory = path.join(runDirectory, "prompts");
+    await mkdir(promptDirectory, { recursive: true });
+    await writeFile(
+      path.join(promptDirectory, `${input.role.name}.md`),
+      `${systemPrompt(input)}\n\n${userPrompt(input)}\n`,
+      "utf8",
+    );
+    const sessionPath = path.join(
+      runDirectory,
+      "sessions",
+      input.role.name,
+      "history.json",
+    );
+    const messages = input.resumeSession ? await loadSession(sessionPath) : [];
+    if (messages.length === 0) {
+      messages.push({ role: "system", content: systemPrompt(input) });
+    } else {
+      messages[0] = { role: "system", content: systemPrompt(input) };
+    }
+    messages.push({ role: "user", content: userPrompt(input) });
+    let rawOutput = "";
+    try {
+      for (let turn = 1; turn <= input.provider.maxAgentTurns; turn++) {
+        if (signal?.aborted) throw new DOMException("VEX run aborted", "AbortError");
+        compactSession(messages);
+        const completion = await completeProvider({
+          provider: input.provider,
+          model: input.runtime.model,
+          thinking: input.runtime.thinking,
+          messages,
+          tools: toolDefinitions(input.role.tools),
+          environment: this.#environment,
+          fetch: this.#fetch,
+          ...(this.#auth ? { auth: this.#auth } : {}),
+          ...(signal ? { signal } : {}),
+          sessionId: input.runId,
+        });
+        const content = completion.content;
+        const calls = completion.toolCalls;
+        const assistant: ProviderMessage = {
+          role: "assistant",
+          content: content || null,
+          ...(calls.length ? { tool_calls: calls } : {}),
+          ...(completion.responseItems
+            ? { response_items: completion.responseItems }
+            : {}),
+        };
+        messages.push(assistant);
+        rawOutput += `${JSON.stringify({ turn, type: "assistant", content, tools: calls.map((call) => call.function.name) })}\n`;
+        if (calls.length === 0) {
+          messages.push({
+            role: "user",
+            content:
+              "Continue using the available tools. You must finish by calling team_yield with a structured result.",
+          });
+          await saveSession(sessionPath, messages);
+          continue;
+        }
+        for (const call of calls) {
+          let args: unknown;
+          try {
+            args = JSON.parse(call.function.arguments);
+          } catch {
+            args = {};
+          }
+          if (call.function.name === "team_yield") {
+            const roleYield = parseRoleYield(args, input.role.name);
+            if (!roleYield) {
+              messages.push({
+                role: "tool",
+                tool_call_id: call.id,
+                content: "ERROR: invalid team_yield payload or role mismatch",
+              });
+              continue;
+            }
+            messages.push({
+              role: "tool",
+              tool_call_id: call.id,
+              content: "VEX accepted the role result.",
+            });
+            await saveSession(sessionPath, messages);
+            rawOutput += `${JSON.stringify({ turn, type: "yield", value: roleYield })}\n`;
+            return {
+              role: input.role.name,
+              exitCode: 0,
+              yield: roleYield,
+              stderr: "",
+              rawOutput,
+            };
+          }
+          let toolResult: string;
+          try {
+            toolResult = await this.#tools.execute(
+              call.function.name,
+              args,
+              input,
+              signal,
+            );
+          } catch (error) {
+            toolResult = `ERROR: ${error instanceof Error ? error.message : String(error)}`;
+          }
+          messages.push({
+            role: "tool",
+            tool_call_id: call.id,
+            content: toolResult,
+          });
+          rawOutput += `${JSON.stringify({ turn, type: "tool", name: call.function.name, result: toolResult.slice(0, 2_000) })}\n`;
+        }
+        await saveSession(sessionPath, messages);
+      }
+      return failure(
+        input,
+        `Agent exceeded ${input.provider.maxAgentTurns} turns without team_yield`,
+        rawOutput,
+      );
+    } catch (error) {
+      if (signal?.aborted) throw new DOMException("VEX run aborted", "AbortError");
+      return failure(
+        input,
+        error instanceof Error ? error.message : String(error),
+        rawOutput,
+      );
+    }
   }
 }

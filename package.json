@@ -1,7 +1,7 @@
 {
-  "name": "pi-vex",
-  "version": "0.1.0",
-  "description": "Fixed-role multi-agent coding orchestration for Pi",
+  "name": "vex-agent-cli",
+  "version": "0.7.1",
+  "description": "Independent adaptive chat, review, and multi-agent engineering CLI",
   "type": "module",
   "license": "Apache-2.0",
   "repository": {
@@ -13,48 +13,45 @@
     "url": "https://github.com/jkesh/Vex/issues"
   },
   "keywords": [
-    "pi-package",
+    "cli",
+    "terminal-ui",
     "coding-agent",
     "multi-agent",
     "worktree",
     "rag"
   ],
   "exports": {
-    ".": "./src/index.ts",
-    "./extension": "./extensions/vex/index.ts",
-    "./knowledge": "./src/knowledge.ts"
+    ".": "./dist/index.js",
+    "./knowledge": "./dist/knowledge.js"
+  },
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "vex": "./dist/cli.js"
   },
   "files": [
-    "extensions",
+    "dist",
     "docs",
     "roles",
-    "src",
     "README.md",
     "LICENSE"
   ],
-  "pi": {
-    "extensions": [
-      "./extensions/vex/index.ts"
-    ]
-  },
   "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "check": "bun run typecheck && bun test",
+    "check": "bun run typecheck && bun test && bun run build",
+    "prepack": "npm run build",
     "pack:check": "npm pack --dry-run"
   },
   "dependencies": {
+    "jsonc-parser": "^3.3.1",
+    "undici": "^7.29.0",
     "yaml": "^2.8.2"
   },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "typebox": "*"
-  },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.1",
     "@types/bun": "1.3.14",
-    "typescript": "^5.7.3",
-    "typebox": "^1.1.24"
+    "typescript": "^5.7.3"
   },
   "engines": {
     "node": ">=22"

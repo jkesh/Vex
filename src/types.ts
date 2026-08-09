@@ -14,6 +14,19 @@ export type WriterRole = Extract<
   "backend" | "frontend" | "test-engineer"
 >;
 export type WorktreeOwner = WriterRole | "integrator";
+export type ThinkingLevel =
+  | "off"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
+
+export type ProviderProtocol =
+  | "openai-chat-completions"
+  | "anthropic-messages";
+export type ModelCatalogProtocol = "openai" | "anthropic";
 
 export type RoleStage =
   | "discovery"
@@ -31,7 +44,10 @@ export type RoleStatus =
   | "aborted";
 export type RunStatus =
   | "created"
+  | "planning"
+  | "awaiting-confirmation"
   | "running"
+  | "awaiting-merge"
   | "completed"
   | "failed"
   | "aborted";
@@ -39,10 +55,13 @@ export type RunPhase =
   | "preflight"
   | "discovery"
   | "design"
+  | "approval"
   | "implementation"
   | "integration"
   | "verification"
   | "review"
+  | "repair"
+  | "ready-to-merge"
   | "finalize"
   | "done";
 
@@ -55,6 +74,37 @@ export interface RoleDefinition {
   spawns: string[];
   systemPrompt: string;
   filePath: string;
+}
+
+export interface RoleRuntimeConfig {
+  provider: string;
+  model: string;
+  thinking: ThinkingLevel;
+  source: "agent" | "default" | "environment" | "session";
+}
+
+export interface ProviderRuntimeConfig {
+  id: string;
+  protocol: ProviderProtocol;
+  modelCatalog: ModelCatalogProtocol;
+  baseUrl: string;
+  apiKeyEnv?: string;
+  requiresAuth: boolean;
+  headersEnv: Record<string, string>;
+  sendReasoningEffort: boolean;
+  timeoutMs: number;
+  maxAgentTurns: number;
+}
+
+export interface ResolvedVexConfig {
+  maxParallelWriters: 1 | 2;
+  maxRepairAttempts: number;
+  projectCommands: string[];
+  defaultProvider: string;
+  provider: ProviderRuntimeConfig;
+  providers: Record<string, ProviderRuntimeConfig>;
+  agents: Record<ModelRole, RoleRuntimeConfig>;
+  sources: string[];
 }
 
 export interface KnowledgeDocument {
@@ -81,39 +131,78 @@ export interface ScoutReport {
 }
 
 export interface RoleAssignment {
+  id: string;
   role: WriterRole;
   objective: string;
-  ownedPaths: string[];
+  allowedPaths: string[];
   dependencies: WriterRole[];
+  expectedResult: string;
+  skipped: boolean;
 }
 
 export interface ExecutionManifest {
+  runId: string;
+  repoRoot: string;
+  baseCommit: string;
+  goal: string;
   summary: string;
+  constraints: string[];
+  contracts: string[];
   assignments: RoleAssignment[];
   integrationOrder: WriterRole[];
+  projectCommands: string[];
+  riskFlags: string[];
+  roleDefinitionHashes: Record<ModelRole, string>;
   securityReview: boolean;
 }
 
+export interface CommandResult {
+  command: string;
+  cwd: string;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  startedAt: string;
+  finishedAt: string;
+}
+
 export interface ChangeResult {
+  assignmentId: string;
   role: WriterRole;
+  attempt: number;
   status: RoleYield["status"];
   summary: string;
   commits: string[];
   changedFiles: string[];
+  commandResults: CommandResult[];
+  notes: string[];
   worktreePath: string;
 }
 
+export type ReviewPriority = 0 | 1 | 2 | 3;
+
 export interface ReviewFinding {
-  severity: "critical" | "high" | "medium" | "low";
-  path?: string;
+  owner: WriterRole;
+  priority: ReviewPriority;
+  file?: string;
   line?: number;
-  message: string;
+  title: string;
+  explanation: string;
+  source: "reviewer" | "security-reviewer";
 }
 
 export interface ReviewReport {
   approved: boolean;
   findings: ReviewFinding[];
   summary: string;
+}
+
+export interface ReviewCycle {
+  attempt: number;
+  reports: Partial<Record<"reviewer" | "security-reviewer", ReviewReport>>;
+  findings: ReviewFinding[];
+  approved: boolean;
+  createdAt: string;
 }
 
 export interface RoleRunInput {
@@ -123,6 +212,9 @@ export interface RoleRunInput {
   cwd: string;
   context: Record<string, unknown>;
   knowledge: KnowledgeDocument[];
+  runtime: RoleRuntimeConfig;
+  provider: ProviderRuntimeConfig;
+  resumeSession?: boolean;
 }
 
 export interface RoleRunResult {
@@ -146,32 +238,70 @@ export interface WorktreeRecord {
 
 export interface RoleState {
   status: RoleStatus;
+  attempts: number;
   startedAt?: string;
   finishedAt?: string;
   summary?: string;
   error?: string;
 }
 
+export interface RunEvent {
+  at: string;
+  type: string;
+  message: string;
+  role?: ModelRole;
+  phase?: RunPhase;
+}
+
 export interface VexRunState {
-  schemaVersion: 1;
+  schemaVersion: 5;
   id: string;
   task: string;
   root: string;
+  executionRoot: string;
+  workspaceKind: "git" | "directory";
+  workspaceFingerprint?: string;
   baseBranch: string;
   baseRef: string;
   status: RunStatus;
   phase: RunPhase;
   securityReview: boolean;
+  projectTrusted: boolean;
+  defaultProvider: string;
+  provider: ProviderRuntimeConfig;
+  providers: Record<string, ProviderRuntimeConfig>;
+  maxParallelWriters: 1 | 2;
+  maxRepairAttempts: number;
+  configuredProjectCommands: string[];
+  configurationSources: string[];
+  roleRuntime: Record<ModelRole, RoleRuntimeConfig>;
+  roleDefinitionHashes: Record<ModelRole, string>;
   createdAt: string;
   updatedAt: string;
+  activePid?: number;
+  approvedAt?: string;
   roles: Record<ModelRole, RoleState>;
+  scoutReport?: ScoutReport;
+  manifest?: ExecutionManifest;
   worktrees: WorktreeRecord[];
   changes: ChangeResult[];
+  commandResults: CommandResult[];
+  reviewCycles: ReviewCycle[];
+  findings: ReviewFinding[];
+  events: RunEvent[];
   integratedCommits: string[];
+  integrationRef?: string;
   finalRef?: string;
+  reviewsApproved: boolean;
   error?: string;
 }
 
 export interface VexRunOptions {
   securityReview?: boolean;
+  model?: string;
+  provider?: string;
+  roleRoutes?: Partial<
+    Record<ModelRole, { provider?: string; model?: string }>
+  >;
+  projectTrusted?: boolean;
 }

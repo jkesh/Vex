@@ -3,7 +3,11 @@ import type { WriterRole } from "./types.js";
 export interface PolicyViolation {
   role: WriterRole;
   path: string;
-  rule: "protected-path" | "role-boundary" | "cross-role-conflict";
+  rule:
+    | "protected-path"
+    | "assignment-boundary"
+    | "role-boundary"
+    | "cross-role-conflict";
   message: string;
 }
 
@@ -21,11 +25,45 @@ const BACKEND_PATH =
 const TEST_PATH =
   /(^|\/)(?:tests?|__tests__|spec|fixtures?)(\/|$)|\.(?:test|spec)\.[^.]+$/i;
 
+function globPattern(pattern: string): RegExp {
+  let expression = "";
+  for (let index = 0; index < pattern.length; index++) {
+    const character = pattern[index]!;
+    if (character === "*" && pattern[index + 1] === "*") {
+      expression += ".*";
+      index++;
+    } else if (character === "*") {
+      expression += "[^/]*";
+    } else if (character === "?") {
+      expression += "[^/]";
+    } else {
+      expression += character.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+    }
+  }
+  return new RegExp(`^${expression}$`, "i");
+}
+
+export function matchesOwnedPath(file: string, ownedPath: string): boolean {
+  const normalizedFile = file.replaceAll("\\", "/").replace(/^\.\//, "");
+  const normalizedOwned = ownedPath
+    .replaceAll("\\", "/")
+    .replace(/^\.\//, "")
+    .replace(/\/$/, "");
+  if (!/[?*]/.test(normalizedOwned)) {
+    return (
+      normalizedFile === normalizedOwned ||
+      normalizedFile.startsWith(`${normalizedOwned}/`)
+    );
+  }
+  return globPattern(normalizedOwned).test(normalizedFile);
+}
+
 export class FileOwnershipPolicy {
   check(
     role: WriterRole,
     files: string[],
     existing: ReadonlyMap<string, WriterRole>,
+    allowedPaths?: readonly string[],
   ): PolicyViolation[] {
     const violations: PolicyViolation[] = [];
 
@@ -37,6 +75,18 @@ export class FileOwnershipPolicy {
           path: file,
           rule: "protected-path",
           message: `${file} is managed by VEX or contains secrets`,
+        });
+      }
+
+      if (
+        allowedPaths &&
+        !allowedPaths.some((ownedPath) => matchesOwnedPath(file, ownedPath))
+      ) {
+        violations.push({
+          role,
+          path: file,
+          rule: "assignment-boundary",
+          message: `${file} is outside the manifest allowed paths for ${role}`,
         });
       }
 

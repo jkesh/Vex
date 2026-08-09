@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { parse } from "yaml";
@@ -69,4 +70,32 @@ export async function loadRoles(
   if (missing.length > 0)
     throw new Error(`Missing fixed roles: ${missing.join(", ")}`);
   return roles;
+}
+
+export function hashRoleDefinition(role: RoleDefinition): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        name: role.name,
+        description: role.description,
+        stage: role.stage,
+        tools: role.tools,
+        writes: role.writes,
+        spawns: role.spawns,
+        systemPrompt: role.systemPrompt,
+      }),
+    )
+    .digest("hex");
+}
+
+export function hashRoleDefinitions(
+  roles: ReadonlyMap<ModelRole, RoleDefinition>,
+): Record<ModelRole, string> {
+  return Object.fromEntries(
+    MODEL_ROLES.map((name) => {
+      const role = roles.get(name);
+      if (!role) throw new Error(`Fixed role is not loaded: ${name}`);
+      return [name, hashRoleDefinition(role)];
+    }),
+  ) as Record<ModelRole, string>;
 }
