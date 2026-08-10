@@ -16,6 +16,7 @@ import {
   parseSgrMouseEvents,
   PromptHistory,
   renderHome,
+  SelectorInputDecoder,
 } from "../src/cli-ui.js";
 
 describe("standalone CLI argument parser", () => {
@@ -325,6 +326,28 @@ describe("standalone CLI argument parser", () => {
       { button: 0, column: 42, row: 8, release: false },
       { button: 0, column: 42, row: 8, release: true },
       { button: 65, column: 18, row: 10, release: false },
+    ]);
+  });
+
+  test("decodes split arrow keys and mouse packets for the model selector", () => {
+    const decoder = new SelectorInputDecoder();
+    expect(decoder.push("\x1b[")).toEqual([]);
+    expect(decoder.push("A\x1b[B\x1bOD\x1b[1;5C")).toEqual([
+      { type: "key", name: "up" },
+      { type: "key", name: "down" },
+      { type: "key", name: "left" },
+      { type: "key", name: "right" },
+    ]);
+    expect(decoder.push("\x1b[<0;42;")).toEqual([]);
+    expect(decoder.push("8M\x1b[<0;42;8m")).toEqual([
+      {
+        type: "mouse",
+        mouse: { button: 0, column: 42, row: 8, release: false },
+      },
+      {
+        type: "mouse",
+        mouse: { button: 0, column: 42, row: 8, release: true },
+      },
     ]);
   });
 

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { VexConfigLoader } from "../src/config.js";
@@ -150,6 +150,61 @@ describe("independent VEX configuration", () => {
       source: "session",
     });
     expect(config.providers.local!.requiresAuth).toBe(false);
+  });
+
+  test("persists interactive model routes in the user directory", async () => {
+    const { home, root } = await fixture();
+    const loader = new VexConfigLoader({
+      homeDirectory: home,
+      environment: {},
+    });
+
+    const routingPath = await loader.saveUserModelRoute(
+      "session-default",
+      "deepseek",
+      "deepseek-v4-flash",
+    );
+    await loader.saveUserModelRoute(
+      "reviewer",
+      "anthropic",
+      "claude-sonnet-4-5",
+    );
+
+    expect(routingPath).toBe(path.join(home, ".vex", "routing.json"));
+    expect(JSON.parse(await readFile(routingPath, "utf8"))).toEqual({
+      defaultProvider: "deepseek",
+      defaultModel: "deepseek-v4-flash",
+      agents: {
+        reviewer: {
+          provider: "anthropic",
+          model: "claude-sonnet-4-5",
+        },
+      },
+    });
+    expect(await loader.userRouting()).toEqual({
+      defaultProvider: "deepseek",
+      defaultModel: "deepseek-v4-flash",
+      agents: {
+        reviewer: {
+          provider: "anthropic",
+          model: "claude-sonnet-4-5",
+        },
+      },
+    });
+
+    const resolved = await new VexConfigLoader({
+      homeDirectory: home,
+      environment: {},
+    }).resolve(root, undefined, false);
+    expect(resolved.agents.backend).toMatchObject({
+      provider: "deepseek",
+      model: "deepseek-v4-flash",
+    });
+    expect(resolved.agents.reviewer).toMatchObject({
+      provider: "anthropic",
+      model: "claude-sonnet-4-5",
+    });
+    expect(resolved.sources).toContain(routingPath);
   });
 
   test("provides Claude natively and accepts OpenAI-compatible gateways", async () => {

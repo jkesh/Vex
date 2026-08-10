@@ -1,4 +1,4 @@
-import { access, readFile } from "node:fs/promises";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -62,6 +62,14 @@ export interface VexConfigLoaderOptions {
   inline?: VexConfigInput;
   environment?: NodeJS.ProcessEnv;
   homeDirectory?: string;
+}
+
+export interface VexUserRouting {
+  defaultProvider?: string;
+  defaultModel?: string;
+  agents: Partial<
+    Record<ModelRole, { provider?: string; model?: string }>
+  >;
 }
 
 interface LoadedConfig {
@@ -426,6 +434,8 @@ async function loadLayers(
   const candidates: string[] = [];
   const user = await firstConfig(path.join(home, ".vex"));
   if (user) candidates.push(user);
+  const userRouting = path.join(home, ".vex", "routing.json");
+  if (await exists(userRouting)) candidates.push(userRouting);
   if (projectTrusted) {
     const project = await firstConfig(path.join(root, ".vex"));
     if (project) candidates.push(project);
@@ -604,6 +614,87 @@ export class VexConfigLoader {
 
   constructor(options: VexConfigLoaderOptions = {}) {
     this.#options = options;
+  }
+
+  #routingPath(): string {
+    return path.join(
+      this.#options.homeDirectory ?? os.homedir(),
+      ".vex",
+      "routing.json",
+    );
+  }
+
+  async userRouting(): Promise<VexUserRouting> {
+    const target = this.#routingPath();
+    if (!(await exists(target))) return { agents: {} };
+    const config = await loadFile(target);
+    return {
+      ...(config.defaultProvider
+        ? { defaultProvider: config.defaultProvider }
+        : {}),
+      ...(config.defaultModel ? { defaultModel: config.defaultModel } : {}),
+      agents: Object.fromEntries(
+        MODEL_ROLES.flatMap((role) => {
+          const agent = config.agents?.[role];
+          if (!agent?.provider && !agent?.model) return [];
+          return [[
+            role,
+            {
+              ...(agent.provider ? { provider: agent.provider } : {}),
+              ...(agent.model ? { model: agent.model } : {}),
+            },
+          ]];
+        }),
+      ),
+    };
+  }
+
+  async saveUserModelRoute(
+    target: "session-default" | ModelRole,
+    provider: string,
+    model: string,
+  ): Promise<string> {
+    const normalizedProvider = provider.trim().toLowerCase();
+    const normalizedModel = model.trim();
+    if (!/^[a-z0-9][a-z0-9._-]*$/i.test(normalizedProvider)) {
+      throw new Error(`Invalid Provider ID: ${provider}`);
+    }
+    if (!normalizedModel) throw new Error("Model ID cannot be empty");
+
+    const filePath = this.#routingPath();
+    const current = await this.userRouting();
+    const next: VexConfigInput = {
+      ...(current.defaultProvider
+        ? { defaultProvider: current.defaultProvider }
+        : {}),
+      ...(current.defaultModel ? { defaultModel: current.defaultModel } : {}),
+      agents: Object.fromEntries(
+        Object.entries(current.agents).map(([role, route]) => [
+          role,
+          { ...route },
+        ]),
+      ),
+    };
+    if (target === "session-default") {
+      next.defaultProvider = normalizedProvider;
+      next.defaultModel = normalizedModel;
+    } else {
+      next.agents = {
+        ...next.agents,
+        [target]: {
+          provider: normalizedProvider,
+          model: normalizedModel,
+        },
+      };
+    }
+    const validated = validateConfig(next, filePath);
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(
+      filePath,
+      `${JSON.stringify(validated, null, 2)}\n`,
+      "utf8",
+    );
+    return filePath;
   }
 
   async resolve(

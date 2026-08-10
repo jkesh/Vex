@@ -375,7 +375,7 @@ Type / for live command hints. Use Up/Down to choose and Tab to complete command
   /model [query]     assign models to targets repeatedly; Esc finishes
   /route [role] [provider] [model]
                      repeatedly choose model then role, or set one explicitly
-  /routing           show current session routing
+  /routing           show saved user model routing and session mode
   /init [--global]   create VEX configuration
   /clear             redraw the coding session
   /quit              exit VEX`;
@@ -426,7 +426,7 @@ const INTERACTIVE_COMMAND_DESCRIPTIONS: Record<string, string> = {
   "/security": "run implementation with Security Reviewer enabled",
   "/providers": "list Provider profiles and authentication status",
   "/models": "open the Provider/model selector",
-  "/routing": "show current session routing",
+  "/routing": "show saved user model routing and session mode",
   "/logout": "remove a saved Provider login",
   "/config": "show resolved Provider and role configuration",
   "/status": "show the latest or selected run",
@@ -912,7 +912,12 @@ function formatInteractiveRouting(
       ? [`${role}: ${route.provider ?? routing.provider ?? "default"}/${route.model ?? routing.model ?? "default"}`]
       : [];
   });
-  return ["Session routing:", `mode: ${mode}`, defaults, ...roles].join("\n");
+  return [
+    "Model routing (saved in ~/.vex/routing.json):",
+    `session mode: ${mode}`,
+    defaults,
+    ...roles,
+  ].join("\n");
 }
 
 async function assertProviderExists(
@@ -1134,7 +1139,7 @@ interface ChooseModelOptions {
   continueAfterTargetAssignment?: boolean;
   onTargetAssigned?(
     selection: SelectedModel & { target: ModelTarget },
-  ): string | void;
+  ): string | void | Promise<string | void>;
   onCatalogs?(catalogs: readonly ProviderModelCatalog[]): void;
 }
 
@@ -1332,11 +1337,16 @@ async function configureModelRoutes(
   const selected = await chooseModel(runtime, cwd, {
     ...options,
     continueAfterTargetAssignment: true,
-    onTargetAssigned(assignment) {
+    async onTargetAssigned(assignment) {
       const message = applySelectedModel(
         routing,
         assignment,
         assignment.target,
+      );
+      await runtime.config.saveUserModelRoute(
+        assignment.target,
+        assignment.provider,
+        assignment.model,
       );
       updates.push(message);
       return message;
@@ -1416,7 +1426,19 @@ function applyInteractiveRouting(
 }
 
 async function interactive(runtime: Runtime, cwd: string): Promise<void> {
-  const routing: InteractiveRoutingState = { roleRoutes: {} };
+  const savedRouting = await runtime.config.userRouting();
+  const routing: InteractiveRoutingState = {
+    ...(savedRouting.defaultProvider
+      ? { provider: savedRouting.defaultProvider }
+      : {}),
+    ...(savedRouting.defaultModel ? { model: savedRouting.defaultModel } : {}),
+    roleRoutes: Object.fromEntries(
+      Object.entries(savedRouting.agents).map(([role, route]) => [
+        role,
+        { ...route },
+      ]),
+    ),
+  };
   const completionContext: InteractiveCompletionContext = {
     providers: (await providerEntries(runtime, cwd)).map(
       (entry) => entry.provider.id,
@@ -1605,8 +1627,9 @@ async function interactive(runtime: Runtime, cwd: string): Promise<void> {
           provider,
           model,
         };
+        await runtime.config.saveUserModelRoute(role, provider, model);
         process.stdout.write(
-          `${role} routed to ${provider}/${model}\n`,
+          `${role} routed to ${provider}/${model} (saved)\n`,
         );
       } catch (error) {
         process.stdout.write(

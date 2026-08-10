@@ -1,6 +1,7 @@
 import { createInterface } from "node:readline/promises";
 import { emitKeypressEvents, type Key } from "node:readline";
 import { stdin, stdout } from "node:process";
+import { StringDecoder } from "node:string_decoder";
 import {
   MODEL_ROLES,
   type RoleStatus,
@@ -809,7 +810,9 @@ export interface ProviderModelTargetSelection<T, U> {
 
 export interface ProviderModelTargetBehavior<T, U> {
   continueAfterAssign?: boolean;
-  onAssign?(selection: ProviderModelTargetSelection<T, U>): string | void;
+  onAssign?(
+    selection: ProviderModelTargetSelection<T, U>,
+  ): string | void | Promise<string | void>;
 }
 
 export interface SgrMouseEvent {
@@ -828,6 +831,167 @@ export function parseSgrMouseEvents(value: string): SgrMouseEvent[] {
       release: match[4] === "m",
     }),
   );
+}
+
+export type SelectorKeyName =
+  | "escape"
+  | "cancel"
+  | "enter"
+  | "tab"
+  | "backspace"
+  | "clear"
+  | "up"
+  | "down"
+  | "left"
+  | "right"
+  | "pageup"
+  | "pagedown"
+  | "home"
+  | "end"
+  | "character";
+
+export type SelectorInputEvent =
+  | { type: "key"; name: SelectorKeyName; character?: string }
+  | { type: "mouse"; mouse: SgrMouseEvent };
+
+function selectorKey(
+  name: SelectorKeyName,
+  character?: string,
+): SelectorInputEvent {
+  return {
+    type: "key",
+    name,
+    ...(character ? { character } : {}),
+  };
+}
+
+function csiKey(parameters: string, final: string): SelectorKeyName | undefined {
+  if (final === "A") return "up";
+  if (final === "B") return "down";
+  if (final === "C") return "right";
+  if (final === "D") return "left";
+  if (final === "H") return "home";
+  if (final === "F") return "end";
+  if (final !== "~") return undefined;
+  const code = Number(parameters.split(";")[0]);
+  if (code === 1 || code === 7) return "home";
+  if (code === 4 || code === 8) return "end";
+  if (code === 5) return "pageup";
+  if (code === 6) return "pagedown";
+  return undefined;
+}
+
+/** Raw decoder used by the full-screen selector, including split ANSI packets. */
+export class SelectorInputDecoder {
+  readonly #decoder = new StringDecoder("utf8");
+  #buffer = "";
+
+  get hasPendingInput(): boolean {
+    return this.#buffer.length > 0;
+  }
+
+  push(value: Buffer | string): SelectorInputEvent[] {
+    this.#buffer += typeof value === "string"
+      ? value
+      : this.#decoder.write(value);
+    return this.#read(false);
+  }
+
+  flush(): SelectorInputEvent[] {
+    this.#buffer += this.#decoder.end();
+    return this.#read(true);
+  }
+
+  #read(flush: boolean): SelectorInputEvent[] {
+    const events: SelectorInputEvent[] = [];
+    while (this.#buffer) {
+      const mouseMatch = this.#buffer.match(
+        /^\x1b\[<(\d+);(\d+);(\d+)([Mm])/,
+      );
+      if (mouseMatch) {
+        events.push({
+          type: "mouse",
+          mouse: {
+            button: Number(mouseMatch[1]),
+            column: Number(mouseMatch[2]),
+            row: Number(mouseMatch[3]),
+            release: mouseMatch[4] === "m",
+          },
+        });
+        this.#buffer = this.#buffer.slice(mouseMatch[0].length);
+        continue;
+      }
+
+      if (this.#buffer.startsWith("\x1b[<")) {
+        if (!flush && /^\x1b\[<[0-9;]*$/.test(this.#buffer)) break;
+        events.push(selectorKey("escape"));
+        this.#buffer = "";
+        continue;
+      }
+
+      const csiMatch = this.#buffer.match(
+        /^\x1b\[([0-9;<=>?]*)([@-~])/,
+      );
+      if (csiMatch) {
+        const name = csiKey(csiMatch[1] ?? "", csiMatch[2] ?? "");
+        if (name) events.push(selectorKey(name));
+        this.#buffer = this.#buffer.slice(csiMatch[0].length);
+        continue;
+      }
+      if (this.#buffer.startsWith("\x1b[")) {
+        if (!flush) break;
+        events.push(selectorKey("escape"));
+        this.#buffer = "";
+        continue;
+      }
+
+      const ss3Match = this.#buffer.match(/^\x1bO([A-DFH])/);
+      if (ss3Match) {
+        const name = csiKey("", ss3Match[1] ?? "");
+        if (name) events.push(selectorKey(name));
+        this.#buffer = this.#buffer.slice(ss3Match[0].length);
+        continue;
+      }
+      if (this.#buffer.startsWith("\x1bO")) {
+        if (!flush) break;
+        events.push(selectorKey("escape"));
+        this.#buffer = "";
+        continue;
+      }
+
+      const first = this.#buffer[0]!;
+      if (first === "\x1b") {
+        if (!flush && this.#buffer.length === 1) break;
+        events.push(selectorKey("escape"));
+        this.#buffer = this.#buffer.slice(1);
+      } else if (first === "\x03") {
+        events.push(selectorKey("cancel"));
+        this.#buffer = this.#buffer.slice(1);
+      } else if (first === "\r" || first === "\n") {
+        events.push(selectorKey("enter"));
+        this.#buffer = first === "\r" && this.#buffer[1] === "\n"
+          ? this.#buffer.slice(2)
+          : this.#buffer.slice(1);
+      } else if (first === "\t") {
+        events.push(selectorKey("tab"));
+        this.#buffer = this.#buffer.slice(1);
+      } else if (first === "\x08" || first === "\x7f") {
+        events.push(selectorKey("backspace"));
+        this.#buffer = this.#buffer.slice(1);
+      } else if (first === "\x15") {
+        events.push(selectorKey("clear"));
+        this.#buffer = this.#buffer.slice(1);
+      } else {
+        const point = this.#buffer.codePointAt(0)!;
+        const character = String.fromCodePoint(point);
+        this.#buffer = this.#buffer.slice(character.length);
+        if (!/^[\u0000-\u001f\u007f]$/.test(character)) {
+          events.push(selectorKey("character", character));
+        }
+      }
+    }
+    return events;
+  }
 }
 
 function visibleStart(active: number, count: number, size: number): number {
@@ -866,13 +1030,12 @@ async function selectProviderModelFlow<T, U>(
         return undefined;
       }
       const selection = { model, target };
-      targetBehavior?.onAssign?.(selection);
+      await targetBehavior?.onAssign?.(selection);
       if (!targetBehavior?.continueAfterAssign) return selection;
     }
   }
 
   const wasPaused = stdin.isPaused();
-  emitKeypressEvents(stdin);
   const wasRaw = stdin.isRaw;
   const terminalWidth = Math.max(48, stdout.columns ?? 96);
   const contentWidth = terminalWidth - 2;
@@ -884,7 +1047,10 @@ async function selectProviderModelFlow<T, U>(
   );
   const firstItemRow = 6;
 
-  return new Promise<T | ProviderModelTargetSelection<T, U> | undefined>((resolve) => {
+  return new Promise<T | ProviderModelTargetSelection<T, U> | undefined>((
+    resolve,
+    reject,
+  ) => {
     let providerIndex = Math.max(
       0,
       providers.findIndex((provider) => provider.id === options.initialProvider),
@@ -896,7 +1062,6 @@ async function selectProviderModelFlow<T, U>(
     let providerStart = 0;
     let modelStart = 0;
     let targetStart = 0;
-    let mouseKeyBuffer = "";
     let step: "models" | "followup" = "models";
     let chosenModel: SelectItem<T> | undefined;
     let chosenProviderLabel = "";
@@ -1035,13 +1200,21 @@ async function selectProviderModelFlow<T, U>(
       );
       stdout.write(`\x1b[H\x1b[2J${lines.join("\n")}`);
     };
-    const finish = (value?: T | ProviderModelTargetSelection<T, U>) => {
+    let escapeTimer: NodeJS.Timeout | undefined;
+    const decoder = new SelectorInputDecoder();
+    let inputQueue = Promise.resolve();
+    const finish = (
+      value?: T | ProviderModelTargetSelection<T, U>,
+      error?: unknown,
+    ) => {
       if (finished) return;
       finished = true;
-      stdin.off("keypress", onKeypress);
+      if (escapeTimer) clearTimeout(escapeTimer);
+      stdin.off("data", onData);
       stdin.setRawMode(Boolean(wasRaw));
       stdout.write("\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[2J\x1b[H");
-      resolve(value);
+      if (error) reject(error);
+      else resolve(value);
       if (wasPaused) {
         setImmediate(() => {
           if (
@@ -1062,12 +1235,12 @@ async function selectProviderModelFlow<T, U>(
       chosenProviderLabel = providers[providerIndex]!.label;
       step = "followup";
     };
-    const acceptTarget = () => {
+    const acceptTarget = async () => {
       const target = followup?.items[targetIndex];
       if (chosenModel && target) {
         const selection = { model: chosenModel.value, target: target.value };
         const selectedModelLabel = `${chosenProviderLabel} / ${chosenModel.label}`;
-        const notice = targetBehavior?.onAssign?.(selection);
+        const notice = await targetBehavior?.onAssign?.(selection);
         if (!targetBehavior?.continueAfterAssign) {
           finish(selection);
           return;
@@ -1107,31 +1280,19 @@ async function selectProviderModelFlow<T, U>(
         ),
       );
     };
-    const onKeypress = (character: string | undefined, key: Key) => {
-      const sequence = key.sequence ?? character ?? "";
-      if (mouseKeyBuffer || sequence.startsWith("\x1b[<")) {
-        mouseKeyBuffer += sequence;
-        for (const mouse of parseSgrMouseEvents(mouseKeyBuffer)) {
-          handleMouse(mouse);
-          if (finished) return;
-        }
-        if (/[Mm]$/.test(mouseKeyBuffer) || mouseKeyBuffer.length > 64) {
-          mouseKeyBuffer = "";
-        }
-        return;
-      }
-      if (key.name === "escape" && step === "followup") {
+    const handleKey = async (event: Extract<SelectorInputEvent, { type: "key" }>) => {
+      if (event.name === "escape" && step === "followup") {
         step = "models";
         render();
         return;
       }
-      if (key.ctrl && key.name === "c" || key.name === "escape") {
+      if (event.name === "cancel" || event.name === "escape") {
         finish();
         return;
       }
-      if (key.name === "return" || key.name === "enter") {
+      if (event.name === "enter") {
         if (step === "followup") {
-          acceptTarget();
+          await acceptTarget();
         } else if (pane === "providers") {
           pane = "models";
         } else {
@@ -1142,17 +1303,17 @@ async function selectProviderModelFlow<T, U>(
         return;
       }
       if (step === "followup") {
-        if (key.name === "up") {
+        if (event.name === "up") {
           moveTarget(-1);
-        } else if (key.name === "down" || key.name === "tab") {
+        } else if (event.name === "down" || event.name === "tab") {
           moveTarget(1);
-        } else if (key.name === "pageup") {
+        } else if (event.name === "pageup") {
           moveTarget(-maxVisible);
-        } else if (key.name === "pagedown") {
+        } else if (event.name === "pagedown") {
           moveTarget(maxVisible);
-        } else if (key.name === "home") {
+        } else if (event.name === "home") {
           targetIndex = 0;
-        } else if (key.name === "end") {
+        } else if (event.name === "end") {
           targetIndex = Math.max(0, (followup?.items.length ?? 0) - 1);
         } else {
           return;
@@ -1160,53 +1321,48 @@ async function selectProviderModelFlow<T, U>(
         render();
         return;
       }
-      if (key.name === "left") {
+      if (event.name === "left") {
         pane = "providers";
-      } else if (key.name === "right") {
+      } else if (event.name === "right") {
         pane = "models";
-      } else if (key.name === "tab") {
+      } else if (event.name === "tab") {
         pane = pane === "providers" ? "models" : "providers";
-      } else if (key.name === "up") {
+      } else if (event.name === "up") {
         pane === "providers" ? moveProvider(-1) : moveModel(-1);
-      } else if (key.name === "down") {
+      } else if (event.name === "down") {
         pane === "providers" ? moveProvider(1) : moveModel(1);
-      } else if (key.name === "pageup") {
+      } else if (event.name === "pageup") {
         pane === "providers"
           ? moveProvider(-maxVisible)
           : moveModel(-maxVisible);
-      } else if (key.name === "pagedown") {
+      } else if (event.name === "pagedown") {
         pane === "providers"
           ? moveProvider(maxVisible)
           : moveModel(maxVisible);
-      } else if (key.name === "home") {
+      } else if (event.name === "home") {
         if (pane === "providers") {
           providerIndex = 0;
           modelIndex = 0;
         } else {
           modelIndex = 0;
         }
-      } else if (key.name === "end") {
+      } else if (event.name === "end") {
         if (pane === "providers") {
           providerIndex = providers.length - 1;
           modelIndex = 0;
         } else {
           modelIndex = Math.max(0, models().length - 1);
         }
-      } else if (key.name === "backspace") {
+      } else if (event.name === "backspace") {
         query = Array.from(query).slice(0, -1).join("");
         modelIndex = 0;
         pane = "models";
-      } else if (key.ctrl && key.name === "u") {
+      } else if (event.name === "clear") {
         query = "";
         modelIndex = 0;
         pane = "models";
-      } else if (
-        character &&
-        !key.ctrl &&
-        !key.meta &&
-        !/^[\u0000-\u001f\u007f]$/.test(character)
-      ) {
-        query += character;
+      } else if (event.name === "character" && event.character) {
+        query += event.character;
         modelIndex = 0;
         pane = "models";
       } else {
@@ -1214,7 +1370,7 @@ async function selectProviderModelFlow<T, U>(
       }
       render();
     };
-    const handleMouse = (mouse: SgrMouseEvent) => {
+    const handleMouse = async (mouse: SgrMouseEvent) => {
       if (step === "followup") {
         if ((mouse.button & 64) !== 0) {
           if (!mouse.release) {
@@ -1223,13 +1379,13 @@ async function selectProviderModelFlow<T, U>(
           }
           return;
         }
-        if (!mouse.release || (mouse.button & 3) !== 0) return;
+        if (mouse.release || (mouse.button & 3) !== 0) return;
         const offset = mouse.row - firstItemRow;
         if (offset < 0 || offset >= maxVisible) return;
         const index = targetStart + offset;
         if (followup?.items[index]) {
           targetIndex = index;
-          acceptTarget();
+          await acceptTarget();
           if (!finished) render();
         }
         return;
@@ -1243,7 +1399,7 @@ async function selectProviderModelFlow<T, U>(
         render();
         return;
       }
-      if (!mouse.release || (mouse.button & 3) !== 0) return;
+      if (mouse.release || (mouse.button & 3) !== 0) return;
       const offset = mouse.row - firstItemRow;
       if (offset < 0 || offset >= maxVisible) return;
       if (overProviders) {
@@ -1262,10 +1418,26 @@ async function selectProviderModelFlow<T, U>(
         if (!finished) render();
       }
     };
+    const enqueue = (events: readonly SelectorInputEvent[]) => {
+      inputQueue = inputQueue.then(async () => {
+        for (const event of events) {
+          if (finished) return;
+          if (event.type === "mouse") await handleMouse(event.mouse);
+          else await handleKey(event);
+        }
+      }).catch((error) => finish(undefined, error));
+    };
+    const onData = (chunk: Buffer | string) => {
+      if (escapeTimer) clearTimeout(escapeTimer);
+      enqueue(decoder.push(chunk));
+      if (decoder.hasPendingInput) {
+        escapeTimer = setTimeout(() => enqueue(decoder.flush()), 35);
+      }
+    };
     stdout.write("\x1b[?25l\x1b[?1000h\x1b[?1006h");
     stdin.setRawMode(true);
     stdin.resume();
-    stdin.on("keypress", onKeypress);
+    stdin.on("data", onData);
     render();
   });
 }
