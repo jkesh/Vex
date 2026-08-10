@@ -30,13 +30,22 @@ function stripAnsi(value: string): string {
 
 function crop(value: string, width: number): string {
   const plain = stripAnsi(value);
-  if (plain.length <= width) return value;
-  return `${plain.slice(0, Math.max(0, width - 1))}…`;
+  if (displayWidth(plain) <= width) return value;
+  const maximum = Math.max(0, width - 1);
+  const glyphs: string[] = [];
+  let used = 0;
+  for (const glyph of Array.from(plain)) {
+    const next = glyphWidth(glyph);
+    if (used + next > maximum) break;
+    glyphs.push(glyph);
+    used += next;
+  }
+  return `${glyphs.join("")}…`;
 }
 
 function pad(value: string, width: number): string {
   const cropped = crop(value, width);
-  return `${cropped}${" ".repeat(Math.max(0, width - stripAnsi(cropped).length))}`;
+  return `${cropped}${" ".repeat(Math.max(0, width - displayWidth(cropped)))}`;
 }
 
 function line(label: string, value: string, width: number): string {
@@ -1001,6 +1010,29 @@ function visibleStart(active: number, count: number, size: number): number {
   );
 }
 
+/** Builds an in-place update without newlines, so terminal history never grows. */
+export function diffTerminalRows(
+  previous: readonly string[],
+  next: readonly string[],
+): string {
+  const height = Math.max(previous.length, next.length);
+  let output = "";
+  for (let index = 0; index < height; index++) {
+    const nextLine = next[index] ?? "";
+    if (previous[index] === nextLine) continue;
+    output += `\x1b[${index + 1};1H\x1b[2K${nextLine}`;
+  }
+  return output;
+}
+
+export function selectorVisibleRows(
+  terminalRows: number,
+  requested = 14,
+): number {
+  // Eight fixed rows are shared by both selector steps, including status/help.
+  return Math.max(1, Math.min(requested, Math.max(1, terminalRows - 8)));
+}
+
 async function selectProviderModelFlow<T, U>(
   title: string,
   providers: readonly ProviderModelPane<T>[],
@@ -1037,13 +1069,16 @@ async function selectProviderModelFlow<T, U>(
 
   const wasPaused = stdin.isPaused();
   const wasRaw = stdin.isRaw;
-  const terminalWidth = Math.max(48, stdout.columns ?? 96);
+  const terminalWidth = Math.max(24, stdout.columns ?? 96);
   const contentWidth = terminalWidth - 2;
-  const providerWidth = Math.max(16, Math.min(30, Math.floor(contentWidth * 0.32)));
-  const modelWidth = Math.max(20, contentWidth - providerWidth - 1);
-  const maxVisible = Math.max(
-    4,
-    Math.min(options.maxVisible ?? 14, Math.max(4, (stdout.rows ?? 24) - 7)),
+  const providerWidth = Math.max(
+    9,
+    Math.min(30, Math.floor(contentWidth * 0.32)),
+  );
+  const modelWidth = contentWidth - providerWidth - 1;
+  const maxVisible = selectorVisibleRows(
+    stdout.rows ?? 24,
+    options.maxVisible ?? 14,
   );
   const firstItemRow = 6;
 
@@ -1066,6 +1101,7 @@ async function selectProviderModelFlow<T, U>(
     let chosenModel: SelectItem<T> | undefined;
     let chosenProviderLabel = "";
     let lastAssignment = "";
+    let renderedLines: string[] = [];
     const assignedTargets = new Set<U>();
     let targetIndex = Math.max(
       0,
@@ -1129,12 +1165,15 @@ async function selectProviderModelFlow<T, U>(
         }
         lines.push(
           `└${"─".repeat(contentWidth)}┘`,
+          "",
           crop(
             `${ansi.dim}↑/↓ move · Enter assign${targetBehavior?.continueAfterAssign ? " and continue" : ""} · Esc back · mouse enabled${ansi.reset}`,
             terminalWidth,
           ),
         );
-        stdout.write(`\x1b[H\x1b[2J${lines.join("\n")}`);
+        const output = diffTerminalRows(renderedLines, lines);
+        if (output) stdout.write(output);
+        renderedLines = lines;
         return;
       }
       providerIndex = Math.max(0, Math.min(providerIndex, providers.length - 1));
@@ -1184,21 +1223,23 @@ async function selectProviderModelFlow<T, U>(
         );
       }
       lines.push(`└${"─".repeat(providerWidth)}┴${"─".repeat(modelWidth)}┘`);
-      if (lastAssignment) {
-        lines.push(
-          crop(
+      lines.push(
+        lastAssignment
+          ? crop(
             `${ansi.green}✓ ${lastAssignment}${ansi.reset} · choose another model or press Esc to finish`,
             terminalWidth,
-          ),
-        );
-      }
+          )
+          : "",
+      );
       lines.push(
         crop(
           `${ansi.dim}←/→ pane · ↑/↓ move · type search · Enter select · Esc ${targetBehavior?.continueAfterAssign ? "done" : "cancel"} · mouse enabled${ansi.reset}`,
           terminalWidth,
         ),
       );
-      stdout.write(`\x1b[H\x1b[2J${lines.join("\n")}`);
+      const output = diffTerminalRows(renderedLines, lines);
+      if (output) stdout.write(output);
+      renderedLines = lines;
     };
     let escapeTimer: NodeJS.Timeout | undefined;
     const decoder = new SelectorInputDecoder();
@@ -1212,7 +1253,9 @@ async function selectProviderModelFlow<T, U>(
       if (escapeTimer) clearTimeout(escapeTimer);
       stdin.off("data", onData);
       stdin.setRawMode(Boolean(wasRaw));
-      stdout.write("\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[2J\x1b[H");
+      stdout.write(
+        "\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l",
+      );
       if (error) reject(error);
       else resolve(value);
       if (wasPaused) {
@@ -1434,7 +1477,7 @@ async function selectProviderModelFlow<T, U>(
         escapeTimer = setTimeout(() => enqueue(decoder.flush()), 35);
       }
     };
-    stdout.write("\x1b[?25l\x1b[?1000h\x1b[?1006h");
+    stdout.write("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h");
     stdin.setRawMode(true);
     stdin.resume();
     stdin.on("data", onData);

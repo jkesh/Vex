@@ -12,11 +12,13 @@ import {
   parseInteractiveInput,
 } from "../src/cli.js";
 import {
+  diffTerminalRows,
   filterSelectItems,
   parseSgrMouseEvents,
   PromptHistory,
   renderHome,
   SelectorInputDecoder,
+  selectorVisibleRows,
 } from "../src/cli-ui.js";
 
 describe("standalone CLI argument parser", () => {
@@ -349,6 +351,19 @@ describe("standalone CLI argument parser", () => {
         mouse: { button: 0, column: 42, row: 8, release: true },
       },
     ]);
+  });
+
+  test("updates selector rows in place without growing terminal history", () => {
+    expect(diffTerminalRows([], ["first", "second"])).toBe(
+      "\x1b[1;1H\x1b[2Kfirst\x1b[2;1H\x1b[2Ksecond",
+    );
+    expect(diffTerminalRows(["first", "second"], ["first", "changed"]))
+      .toBe("\x1b[2;1H\x1b[2Kchanged");
+    expect(diffTerminalRows(["first", "second"], ["first"]))
+      .toBe("\x1b[2;1H\x1b[2K");
+    expect(selectorVisibleRows(24)).toBe(14);
+    expect(selectorVisibleRows(12)).toBe(4);
+    expect(selectorVisibleRows(6)).toBe(1);
   });
 
   test("recognizes execution through an npm-style directory link", async () => {

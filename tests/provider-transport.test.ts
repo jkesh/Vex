@@ -73,7 +73,7 @@ describe("Provider wire transport", () => {
         expect(headers.get("chatgpt-account-id")).toBe("account-42");
         expect(headers.get("originator")).toBe("vex");
         expect(headers.get("session-id")).toBe("run-42");
-        expect(headers.get("user-agent")).toContain("vex/0.8.1");
+        expect(headers.get("user-agent")).toContain("vex/0.8.2");
         request = JSON.parse(String(init?.body)) as Record<string, unknown>;
         const output = [
           {
