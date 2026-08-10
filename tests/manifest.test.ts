@@ -8,6 +8,17 @@ function architect(payload: unknown): RoleRunResult {
     exitCode: 0,
     stderr: "",
     rawOutput: "",
+    usage: {
+      provider: "fixture",
+      model: "architect-model",
+      requests: 1,
+      reportedRequests: 1,
+      inputTokens: 10,
+      outputTokens: 5,
+      cachedInputTokens: 0,
+      reasoningTokens: 0,
+      totalTokens: 15,
+    },
     yield: {
       role: "architect",
       status: "completed",

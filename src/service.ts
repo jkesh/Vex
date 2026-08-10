@@ -2,6 +2,8 @@ import path from "node:path";
 import { terminatePidTree } from "./command-runner.js";
 import type { VexOrchestrator } from "./orchestrator.js";
 import { createRunId } from "./orchestrator.js";
+import { roleStatusLabel, transitionRoleState } from "./role-state.js";
+import { formatRunTokenUsage, formatTokenCount } from "./usage.js";
 import type { RunStateStore } from "./state-store.js";
 import type { VexRunOptions, VexRunState } from "./types.js";
 import type { WorktreeManager } from "./worktrees.js";
@@ -78,7 +80,13 @@ export class VexService {
     const activeId = this.abort();
     if (activeId) return activeId;
     const state = await this.#select(cwd, runId, false);
-    if (!state || state.status === "completed" || state.status === "aborted") {
+    if (
+      !state ||
+      state.status === "completed" ||
+      state.status === "awaiting-merge" ||
+      state.status === "failed" ||
+      state.status === "aborted"
+    ) {
       return undefined;
     }
     state.status = "aborted";
@@ -88,8 +96,15 @@ export class VexService {
       : "Run aborted by the user while no worker was active";
     delete state.activePid;
     state.reviewsApproved = false;
-    for (const role of Object.values(state.roles)) {
-      if (role.status === "running") role.status = "aborted";
+    const abortedAt = new Date().toISOString();
+    for (const [name, role] of Object.entries(state.roles)) {
+      if (role.status === "running" || role.status === "waiting") {
+        state.roles[name as keyof typeof state.roles] = transitionRoleState(
+          role,
+          "aborted",
+          { at: abortedAt, error: state.error },
+        );
+      }
     }
     state.events.push({
       at: new Date().toISOString(),
@@ -191,8 +206,16 @@ export class VexService {
 
 export function formatRunState(state: VexRunState): string {
   const roles = Object.entries(state.roles)
-    .filter(([, role]) => role.status !== "pending")
-    .map(([name, role]) => `${name}=${role.status}#${role.attempts}`)
+    .map(([name, role]) => {
+      const waiting = role.status === "waiting" && role.waitingFor
+        ? `(${role.waitingFor})`
+        : "";
+      const agentUsage = state.usage.agents[name as keyof typeof state.usage.agents];
+      const tokens = agentUsage.requests > 0
+        ? `@${formatTokenCount(agentUsage.totalTokens)}tok`
+        : "";
+      return `${name}=${roleStatusLabel(role.status)}${waiting}#${role.attempts}${tokens}`;
+    })
     .join(", ");
   const ref = state.finalRef
     ? ` ref=${state.finalRef.slice(0, 12)}`
@@ -204,7 +227,12 @@ export function formatRunState(state: VexRunState): string {
     ? ` worktrees=${state.worktrees.length}`
     : "";
   const error = state.error ? ` error=${state.error}` : "";
-  return `VEX ${state.id} status=${state.status} phase=${state.phase}${ref}${findings}${cleanup}${roles ? ` roles=[${roles}]` : ""}${error}`;
+  const usage = ` usage=${formatTokenCount(state.usage.total.totalTokens)}tok(${state.usage.total.reportedRequests}/${state.usage.total.requests} calls)`;
+  return `VEX ${state.id} status=${state.status} phase=${state.phase}${ref}${findings}${cleanup}${roles ? ` roles=[${roles}]` : ""}${usage}${error}`;
+}
+
+export function formatUsageState(state: VexRunState): string {
+  return `VEX ${state.id} token usage\n${formatRunTokenUsage(state.usage)}`;
 }
 
 export function formatExecutionPlan(state: VexRunState): string {

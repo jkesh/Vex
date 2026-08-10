@@ -10,6 +10,7 @@ import { VexOrchestrator } from "../src/orchestrator.js";
 import { FileOwnershipPolicy } from "../src/policy.js";
 import { loadRoles } from "../src/roles.js";
 import { RunStateStore } from "../src/state-store.js";
+import { formatRunState, VexService } from "../src/service.js";
 import type {
   ModelRole,
   RoleRunInput,
@@ -43,9 +44,10 @@ async function createRepository(): Promise<string> {
 }
 
 class FixtureRunner {
-  readonly git = new GitClient();
   readonly inputs: RoleRunInput[] = [];
+  architectCalls = 0;
   reviewerCalls = 0;
+  testEngineerCalls = 0;
 
   async run(input: RoleRunInput): Promise<RoleRunResult> {
     this.inputs.push(input);
@@ -54,6 +56,17 @@ class FixtureRunner {
       exitCode: 0,
       stderr: "",
       rawOutput: "",
+      usage: {
+        provider: input.runtime.provider,
+        model: input.runtime.model,
+        requests: 1,
+        reportedRequests: 1,
+        inputTokens: 100,
+        outputTokens: 25,
+        cachedInputTokens: 10,
+        reasoningTokens: 5,
+        totalTokens: 125,
+      },
     } as const;
     if (input.role.name === "scout") {
       return {
@@ -68,6 +81,12 @@ class FixtureRunner {
       };
     }
     if (input.role.name === "architect") {
+      const invalid = this.architectCalls++ === 0;
+      if (!invalid) {
+        expect(input.context.manifestValidationError).toContain(
+          "ownership overlaps",
+        );
+      }
       return {
         ...base,
         yield: {
@@ -93,7 +112,7 @@ class FixtureRunner {
               {
                 role: "test-engineer",
                 objective: "cover the server module",
-                ownedPaths: ["tests/**"],
+                ownedPaths: invalid ? ["src/**"] : ["tests/**"],
                 dependencies: ["backend", "frontend"],
               },
             ],
@@ -113,12 +132,6 @@ class FixtureRunner {
           : "export const ready = true;\n",
         "utf8",
       );
-      await this.git.run(input.cwd, ["add", "src/server.ts"]);
-      await this.git.run(input.cwd, [
-        "commit",
-        "-m",
-        "feat: add server module",
-      ]);
       return {
         ...base,
         yield: {
@@ -141,24 +154,49 @@ class FixtureRunner {
       };
     }
     if (input.role.name === "test-engineer") {
+      const repairing = typeof input.context.repairAttempt === "number";
+      if (!repairing && this.testEngineerCalls++ === 0) {
+        return {
+          ...base,
+          exitCode: 1,
+          stderr: "terminated",
+          rawOutput: '{"type":"error","message":"terminated"}\n',
+          usage: {
+            ...base.usage,
+            reportedRequests: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            cachedInputTokens: 0,
+            reasoningTokens: 0,
+            totalTokens: 0,
+          },
+          yield: {
+            role: "test-engineer",
+            status: "failed",
+            summary: "terminated",
+            artifacts: [],
+          },
+        };
+      }
+      if (repairing) {
+        expect(
+          await readFile(path.join(input.cwd, "src", "server.ts"), "utf8"),
+        ).toContain('ready = "repaired"');
+      }
       await mkdir(path.join(input.cwd, "tests"), { recursive: true });
       await writeFile(
         path.join(input.cwd, "tests", "server.test.ts"),
-        "// focused fixture test\n",
+        repairing
+          ? "// repaired fixture coverage\n"
+          : "// focused fixture test\n",
         "utf8",
       );
-      await this.git.run(input.cwd, ["add", "tests/server.test.ts"]);
-      await this.git.run(input.cwd, [
-        "commit",
-        "-m",
-        "test: cover server module",
-      ]);
       return {
         ...base,
         yield: {
           role: "test-engineer",
           status: "completed",
-          summary: "coverage added",
+          summary: repairing ? "coverage repaired" : "coverage added",
           artifacts: ["tests/server.test.ts"],
         },
       };
@@ -182,6 +220,14 @@ class FixtureRunner {
                 line: 1,
                 title: "Harden readiness state",
                 explanation: "Use the repaired readiness state in this fixture.",
+              },
+              {
+                owner: "test-engineer",
+                priority: 2,
+                file: "tests/server.test.ts",
+                line: 1,
+                title: "Cover the repaired readiness state",
+                explanation: "Verify the backend repair from the refreshed worktree.",
               },
             ],
           },
@@ -262,7 +308,7 @@ async function createHarness(root: string, runtimeBase = path.dirname(root)) {
 describe("VexOrchestrator", () => {
   test("plans, waits for approval, integrates, and merges only explicitly", async () => {
     const root = await createRepository();
-    const { git, store, runner, orchestrator } = await createHarness(root);
+    const { git, worktrees, store, runner, orchestrator } = await createHarness(root);
 
     const planned = await orchestrator.plan(
       root,
@@ -271,10 +317,26 @@ describe("VexOrchestrator", () => {
     );
     expect(planned.status).toBe("awaiting-confirmation");
     expect(planned.phase).toBe("approval");
-    expect(planned.schemaVersion).toBe(5);
+    expect(planned.schemaVersion).toBe(7);
     expect(planned.provider.protocol).toBe("openai-chat-completions");
     expect(planned.manifest?.runId).toBe("fixture-run");
     expect(planned.worktrees).toEqual([]);
+    expect(planned.roles.architect.attempts).toBe(2);
+    expect(planned.roles.backend).toMatchObject({
+      status: "waiting",
+      waitingFor: "execution approval",
+    });
+    expect(planned.roles.reviewer.status).toBe("pending");
+    expect(formatRunState(planned)).toContain(
+      "backend=waiting(execution approval)#0",
+    );
+    expect(formatRunState(planned)).toContain("reviewer=not-started#0");
+    expect(
+      planned.events.some((event) => event.type === "manifest-rejected"),
+    ).toBe(true);
+    expect(
+      planned.events.some((event) => event.type === "role-waiting"),
+    ).toBe(true);
     const runDirectory = await store.runDirectory(root, "fixture-run");
     expect(
       JSON.parse(
@@ -305,10 +367,50 @@ describe("VexOrchestrator", () => {
       "frontend",
       "test-engineer",
       "backend",
+      "test-engineer",
     ]);
     expect(ready.worktrees.length).toBeGreaterThan(0);
     expect(ready.reviewCycles).toHaveLength(2);
     expect(ready.findings).toEqual([]);
+    expect(formatRunState(ready)).toContain("backend=delivered#2");
+    expect(formatRunState(ready)).toContain("test-engineer=delivered#3");
+    expect(ready.roles["test-engineer"].attempts).toBe(3);
+    expect(ready.usage.agents["test-engineer"]).toMatchObject({
+      provider: "fixture",
+      model: "fixture/test-engineer",
+      requests: 3,
+      reportedRequests: 2,
+      totalTokens: 250,
+    });
+    expect(ready.usage.total.requests).toBe(runner.inputs.length);
+    expect(
+      ready.usage.models.reduce((total, model) => total + model.requests, 0),
+    ).toBe(runner.inputs.length);
+    expect(
+      ready.usage.models.find(
+        (model) => model.model === "fixture/test-engineer",
+      ),
+    ).toMatchObject({
+      provider: "fixture",
+      requests: 3,
+      reportedRequests: 2,
+      totalTokens: 250,
+    });
+    expect(
+      ready.events.some(
+        (event) =>
+          event.type === "role-retry-scheduled" &&
+          event.role === "test-engineer" &&
+          event.message.includes("transient Provider retry 1/2"),
+      ),
+    ).toBe(true);
+    expect(
+      runner.inputs.filter(
+        (input) =>
+          input.role.name === "test-engineer" &&
+          typeof input.context.repairAttempt !== "number",
+      ),
+    ).toHaveLength(2);
     expect(
       runner.inputs.filter((input) => input.role.name === "backend"),
     ).toHaveLength(2);
@@ -319,9 +421,20 @@ describe("VexOrchestrator", () => {
       ),
     ).toBeDefined();
     expect(
+      runner.inputs
+        .filter((input) => input.role.name === "reviewer")
+        .every((input) => input.resumeSession !== true),
+    ).toBe(true);
+    expect(
       (await git.run(root, ["cat-file", "-e", "HEAD:src/server.ts"], true))
         .exitCode,
     ).not.toBe(0);
+
+    const service = new VexService(orchestrator, store, worktrees);
+    expect(await service.abortRun(root, "fixture-run")).toBeUndefined();
+    expect((await store.load(root, "fixture-run")).status).toBe(
+      "awaiting-merge",
+    );
 
     const state = await orchestrator.merge(root, "fixture-run");
     expect(state.status).toBe("completed");
@@ -332,7 +445,7 @@ describe("VexOrchestrator", () => {
     ).toContain('ready = "repaired"');
     expect(
       await readFile(path.join(root, "tests", "server.test.ts"), "utf8"),
-    ).toContain("focused fixture");
+    ).toContain("repaired fixture coverage");
     expect(await git.output(root, ["status", "--porcelain"])).toBe("");
     expect((await store.latest(root))?.finalRef).toBe(state.finalRef);
     expect(

@@ -64,6 +64,48 @@ function role(name: "scout" | "reviewer"): RoleDefinition {
   };
 }
 
+function usage(model: string) {
+  return {
+    provider: "fixture",
+    model,
+    requests: 1,
+    reportedRequests: 1,
+    inputTokens: 20,
+    outputTokens: 10,
+    cachedInputTokens: 2,
+    reasoningTokens: 1,
+    totalTokens: 30,
+  };
+}
+
+function reviewerResult(): RoleRunResult {
+  return {
+    role: "reviewer",
+    exitCode: 0,
+    stderr: "",
+    rawOutput: "review log",
+    usage: usage("reviewer-model"),
+    yield: {
+      role: "reviewer",
+      status: "completed",
+      summary: "one issue",
+      artifacts: [],
+      payload: {
+        summary: "Architecture needs one correction.",
+        findings: [{
+          priority: 1,
+          category: "correctness",
+          title: "Unsafe fallback",
+          explanation: "The fallback hides provider failures.",
+          file: "src/index.ts",
+          line: 12,
+        }],
+        recommendations: ["Make fallback state explicit."],
+      },
+    },
+  };
+}
+
 describe("semantic work modes", () => {
   test("routes clear conversational, review, and implementation intents", () => {
     expect(classifyWorkMode("你好").mode).toBe("chat");
@@ -73,6 +115,12 @@ describe("semantic work modes", () => {
       confidence: 0.99,
     });
     expect(classifyWorkMode("评审当前项目的认证架构和风险").mode).toBe("review");
+    expect(classifyWorkMode("只审查当前代码仓库，不要修改").mode).toBe(
+      "code-review",
+    );
+    expect(classifyWorkMode("Please code review this repository").mode).toBe(
+      "code-review",
+    );
     expect(classifyWorkMode("帮我看看这个项目的错误处理").mode).toBe("review");
     expect(classifyWorkMode("解释一下当前项目的模式路由").mode).toBe("review");
     expect(classifyWorkMode("实现登录页面并补充回归测试").mode).toBe(
@@ -87,6 +135,7 @@ describe("semantic work modes", () => {
     );
     expect(classifyWorkMode("Review the auth code and fix its fallback").mode)
       .toBe("implement");
+    expect(classifyWorkMode("代码审查并修复发现的问题").mode).toBe("implement");
   });
 
   test("keeps short continuation prompts in the previous session mode", async () => {
@@ -169,6 +218,7 @@ describe("semantic work modes", () => {
             exitCode: 0,
             stderr: "",
             rawOutput: "scout log",
+            usage: usage("scout-model"),
             yield: {
               role: "scout",
               status: "completed",
@@ -183,30 +233,7 @@ describe("semantic work modes", () => {
             },
           };
         }
-        return {
-          role: "reviewer",
-          exitCode: 0,
-          stderr: "",
-          rawOutput: "review log",
-          yield: {
-            role: "reviewer",
-            status: "completed",
-            summary: "one issue",
-            artifacts: [],
-            payload: {
-              summary: "Architecture needs one correction.",
-              findings: [{
-                priority: 1,
-                category: "correctness",
-                title: "Unsafe fallback",
-                explanation: "The fallback hides provider failures.",
-                file: "src/index.ts",
-                line: 12,
-              }],
-              recommendations: ["Make fallback state explicit."],
-            },
-          },
-        };
+        return reviewerResult();
       },
     };
 
@@ -251,10 +278,80 @@ describe("semantic work modes", () => {
         file: "src/index.ts",
         line: 12,
       });
+      expect(report.usage.total).toMatchObject({
+        requests: 2,
+        reportedRequests: 2,
+        totalTokens: 60,
+      });
+      expect(report.usage.agents.scout.totalTokens).toBe(30);
+      expect(report.usage.agents.reviewer.totalTokens).toBe(30);
+      expect(
+        JSON.parse(
+          await readFile(path.join(path.dirname(report.artifactPath), "usage.json"), "utf8"),
+        ),
+      ).toMatchObject({ total: { requests: 2, totalTokens: 60 } });
       expect(JSON.parse(await readFile(report.artifactPath, "utf8"))).toMatchObject({
+        mode: "technical-review",
         id: report.id,
         summary: "Architecture needs one correction.",
       });
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("runs built-in code review with only the read-only Reviewer", async () => {
+    const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "vex-code-review-"));
+    const inputs: RoleRunInput[] = [];
+    const runner = {
+      async run(input: RoleRunInput): Promise<RoleRunResult> {
+        inputs.push(input);
+        return reviewerResult();
+      },
+    };
+
+    try {
+      const service = new VexModeService({
+        roles: new Map([["reviewer" as const, role("reviewer")]]),
+        runner,
+        config: { async resolve() { return configuration; } },
+        worktrees: {
+          async inspectWorkspace() {
+            return {
+              root: temporaryRoot,
+              kind: "directory" as const,
+              branch: "",
+              head: "",
+              dirty: false,
+            };
+          },
+        },
+        homeDirectory: temporaryRoot,
+      });
+      const report = await service.codeReview(
+        temporaryRoot,
+        "review repository code",
+      );
+
+      expect(inputs.map((input) => input.role.name)).toEqual(["reviewer"]);
+      expect(inputs[0]!.role.tools).toEqual([
+        "read",
+        "ls",
+        "find",
+        "grep",
+        "team_yield",
+      ]);
+      expect(inputs[0]!.role.writes).toBe(false);
+      expect(inputs[0]!.context).toMatchObject({ mode: "code-review" });
+      expect(inputs[0]!.context).not.toHaveProperty("scout");
+      expect(inputs[0]!.role.systemPrompt).toContain("only Agent");
+      expect(report).toMatchObject({
+        mode: "code-review",
+        provider: "fixture",
+        model: "reviewer-model",
+        usage: { total: { requests: 1, totalTokens: 30 } },
+      });
+      expect(path.basename(report.artifactPath)).toBe("code-review.json");
     } finally {
       await rm(temporaryRoot, { recursive: true, force: true });
     }

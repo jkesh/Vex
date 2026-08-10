@@ -102,6 +102,7 @@ describe("independent VEX configuration", () => {
     expect(config.agents.scout.model).toBe("command/model");
     expect(config.agents.scout.source).toBe("session");
     expect(config.provider.baseUrl).toBe("http://localhost:11434/v1");
+    expect(config.maxRepairAttempts).toBe(4);
   });
 
   test("routes every role to an independent Provider and model", async () => {

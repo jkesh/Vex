@@ -36,6 +36,7 @@ export type RoleStage =
   | "review";
 export type RoleStatus =
   | "pending"
+  | "waiting"
   | "running"
   | "completed"
   | "skipped"
@@ -94,6 +95,40 @@ export interface ProviderRuntimeConfig {
   sendReasoningEffort: boolean;
   timeoutMs: number;
   maxAgentTurns: number;
+}
+
+export interface ProviderTokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens: number;
+  reasoningTokens: number;
+  totalTokens: number;
+}
+
+export interface TokenUsage extends ProviderTokenUsage {
+  requests: number;
+  reportedRequests: number;
+}
+
+export interface AgentTokenUsage extends TokenUsage {
+  provider: string;
+  model: string;
+}
+
+export interface ModelTokenUsage extends TokenUsage {
+  provider: string;
+  model: string;
+}
+
+export interface ProviderUsage extends TokenUsage {
+  provider: string;
+}
+
+export interface RunTokenUsage {
+  total: TokenUsage;
+  agents: Record<ModelRole, AgentTokenUsage>;
+  providers: ProviderUsage[];
+  models: ModelTokenUsage[];
 }
 
 export interface ResolvedVexConfig {
@@ -223,6 +258,7 @@ export interface RoleRunResult {
   yield: RoleYield;
   stderr: string;
   rawOutput: string;
+  usage: AgentTokenUsage;
 }
 
 export interface RoleRunner {
@@ -239,6 +275,8 @@ export interface WorktreeRecord {
 export interface RoleState {
   status: RoleStatus;
   attempts: number;
+  statusChangedAt: string;
+  waitingFor?: string;
   startedAt?: string;
   finishedAt?: string;
   summary?: string;
@@ -254,7 +292,7 @@ export interface RunEvent {
 }
 
 export interface VexRunState {
-  schemaVersion: 5;
+  schemaVersion: 7;
   id: string;
   task: string;
   root: string;
@@ -281,6 +319,7 @@ export interface VexRunState {
   activePid?: number;
   approvedAt?: string;
   roles: Record<ModelRole, RoleState>;
+  usage: RunTokenUsage;
   scoutReport?: ScoutReport;
   manifest?: ExecutionManifest;
   worktrees: WorktreeRecord[];

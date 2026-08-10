@@ -73,7 +73,7 @@ describe("Provider wire transport", () => {
         expect(headers.get("chatgpt-account-id")).toBe("account-42");
         expect(headers.get("originator")).toBe("vex");
         expect(headers.get("session-id")).toBe("run-42");
-        expect(headers.get("user-agent")).toContain("vex/0.7.3");
+        expect(headers.get("user-agent")).toContain("vex/0.8.0");
         request = JSON.parse(String(init?.body)) as Record<string, unknown>;
         const output = [
           {
@@ -98,7 +98,16 @@ describe("Provider wire transport", () => {
         return new Response(
           `data: ${JSON.stringify({
             type: "response.completed",
-            response: { output },
+            response: {
+              output,
+              usage: {
+                input_tokens: 120,
+                output_tokens: 30,
+                total_tokens: 150,
+                input_tokens_details: { cached_tokens: 40 },
+                output_tokens_details: { reasoning_tokens: 12 },
+              },
+            },
           })}\n\ndata: [DONE]\n\n`,
           { status: 200, headers: { "content-type": "text/event-stream" } },
         );
@@ -127,6 +136,13 @@ describe("Provider wire transport", () => {
     expect(JSON.stringify(completion.responseItems)).toContain(
       "opaque-reasoning",
     );
+    expect(completion.usage).toEqual({
+      inputTokens: 120,
+      outputTokens: 30,
+      cachedInputTokens: 40,
+      reasoningTokens: 12,
+      totalTokens: 150,
+    });
   });
 
   test("loads the OAuth model catalog from the Codex backend", async () => {
@@ -166,10 +182,27 @@ describe("Provider wire transport", () => {
         );
         return new Response(JSON.stringify({
           choices: [{ message: { content: "hello back" } }],
+          usage: {
+            prompt_tokens: 20,
+            completion_tokens: 5,
+            total_tokens: 25,
+            prompt_cache_hit_tokens: 8,
+            completion_tokens_details: { reasoning_tokens: 2 },
+          },
         }), { status: 200 });
       },
     });
-    expect(completion).toEqual({ content: "hello back", toolCalls: [] });
+    expect(completion).toEqual({
+      content: "hello back",
+      toolCalls: [],
+      usage: {
+        inputTokens: 20,
+        outputTokens: 5,
+        cachedInputTokens: 8,
+        reasoningTokens: 2,
+        totalTokens: 25,
+      },
+    });
   });
 
   test("uses native Anthropic Messages with tool-use round trips", async () => {
@@ -225,6 +258,12 @@ describe("Provider wire transport", () => {
               input: { path: "notes.md", content: "done" },
             },
           ],
+          usage: {
+            input_tokens: 70,
+            output_tokens: 20,
+            cache_creation_input_tokens: 10,
+            cache_read_input_tokens: 30,
+          },
         }), { status: 200 });
       },
     });
@@ -251,6 +290,13 @@ describe("Provider wire transport", () => {
       },
     }]);
     expect(completion.responseItems).toHaveLength(2);
+    expect(completion.usage).toEqual({
+      inputTokens: 110,
+      outputTokens: 20,
+      cachedInputTokens: 30,
+      reasoningTokens: 0,
+      totalTokens: 130,
+    });
   });
 
   test("paginates the Anthropic model catalog and preserves model hints", async () => {

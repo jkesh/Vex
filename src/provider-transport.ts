@@ -3,6 +3,7 @@ import type { ProviderAuthorization } from "./auth.js";
 import { vexFetch } from "./http-client.js";
 import { OPENAI_CODEX_BASE_URL } from "./openai-oauth.js";
 import type {
+  ProviderTokenUsage,
   ProviderRuntimeConfig,
   ThinkingLevel,
 } from "./types.js";
@@ -42,6 +43,7 @@ export interface ProviderCompletion {
   content: string;
   toolCalls: ProviderToolCall[];
   responseItems?: unknown[];
+  usage?: ProviderTokenUsage;
 }
 
 export interface ProviderCompletionInput {
@@ -95,6 +97,7 @@ interface ChatCompletionPayload {
     message?: { content?: unknown; tool_calls?: unknown };
   }>;
   error?: { message?: unknown };
+  usage?: unknown;
 }
 
 interface ResolvedAuthorization {
@@ -104,6 +107,81 @@ interface ResolvedAuthorization {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function tokenCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.trunc(value)
+    : undefined;
+}
+
+function firstTokenCount(...values: unknown[]): number {
+  for (const value of values) {
+    const count = tokenCount(value);
+    if (count !== undefined) return count;
+  }
+  return 0;
+}
+
+function openAiTokenUsage(value: unknown): ProviderTokenUsage | undefined {
+  if (!isRecord(value)) return undefined;
+  const recognized = [
+    "prompt_tokens",
+    "completion_tokens",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+  ].some((key) => key in value);
+  if (!recognized) return undefined;
+  const inputDetails = isRecord(value.prompt_tokens_details)
+    ? value.prompt_tokens_details
+    : isRecord(value.input_tokens_details)
+      ? value.input_tokens_details
+      : {};
+  const outputDetails = isRecord(value.completion_tokens_details)
+    ? value.completion_tokens_details
+    : isRecord(value.output_tokens_details)
+      ? value.output_tokens_details
+      : {};
+  const inputTokens = firstTokenCount(value.prompt_tokens, value.input_tokens);
+  const outputTokens = firstTokenCount(
+    value.completion_tokens,
+    value.output_tokens,
+  );
+  return {
+    inputTokens,
+    outputTokens,
+    cachedInputTokens: firstTokenCount(
+      inputDetails.cached_tokens,
+      value.prompt_cache_hit_tokens,
+      value.cached_input_tokens,
+    ),
+    reasoningTokens: firstTokenCount(
+      outputDetails.reasoning_tokens,
+      value.reasoning_tokens,
+    ),
+    totalTokens: firstTokenCount(
+      value.total_tokens,
+      inputTokens + outputTokens,
+    ),
+  };
+}
+
+function anthropicTokenUsage(value: unknown): ProviderTokenUsage | undefined {
+  if (!isRecord(value)) return undefined;
+  if (!("input_tokens" in value) && !("output_tokens" in value)) return undefined;
+  const uncachedInput = firstTokenCount(value.input_tokens);
+  const cacheCreation = firstTokenCount(value.cache_creation_input_tokens);
+  const cachedInputTokens = firstTokenCount(value.cache_read_input_tokens);
+  const inputTokens = uncachedInput + cacheCreation + cachedInputTokens;
+  const outputTokens = firstTokenCount(value.output_tokens);
+  return {
+    inputTokens,
+    outputTokens,
+    cachedInputTokens,
+    reasoningTokens: firstTokenCount(value.reasoning_tokens),
+    totalTokens: inputTokens + outputTokens,
+  };
 }
 
 function cleanBaseUrl(value: string): string {
@@ -248,9 +326,11 @@ function chatCompletion(
 ): ProviderCompletion {
   const rawMessage = payload.choices?.[0]?.message;
   if (!rawMessage) throw new Error("Provider response has no assistant message");
+  const usage = openAiTokenUsage(payload.usage);
   return {
     content: contentText(rawMessage.content),
     toolCalls: normalizeToolCalls(rawMessage.tool_calls),
+    ...(usage ? { usage } : {}),
   };
 }
 
@@ -459,7 +539,17 @@ function responsesCompletion(text: string, status: number): ProviderCompletion {
     if (Array.isArray(payload.output)) items.push(...payload.output);
     if (typeof payload.output_text === "string") fallbackText = payload.output_text;
   }
-  return completionFromResponseItems(items, fallbackText);
+  let usage: ProviderTokenUsage | undefined;
+  for (let index = events.length - 1; index >= 0 && !usage; index -= 1) {
+    const event = events[index];
+    if (!isRecord(event)) continue;
+    const payload = isRecord(event.response) ? event.response : event;
+    usage = openAiTokenUsage(payload.usage ?? event.usage);
+  }
+  return {
+    ...completionFromResponseItems(items, fallbackText),
+    ...(usage ? { usage } : {}),
+  };
 }
 
 interface AnthropicWireMessage {
@@ -470,6 +560,7 @@ interface AnthropicWireMessage {
 interface AnthropicMessagePayload {
   content?: unknown;
   error?: { message?: unknown };
+  usage?: unknown;
 }
 
 function toolInput(argumentsText: string): Record<string, unknown> {
@@ -579,10 +670,12 @@ function anthropicCompletion(
       });
     }
   }
+  const usage = anthropicTokenUsage(payload.usage);
   return {
     content: text.join("\n").trim(),
     toolCalls,
     ...(responseItems.length > 0 ? { responseItems } : {}),
+    ...(usage ? { usage } : {}),
   };
 }
 

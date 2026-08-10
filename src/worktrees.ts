@@ -39,6 +39,20 @@ const EXCLUDED_DIRECTORIES = new Set([
   "node_modules",
 ]);
 
+const GENERATED_DIRECTORY_NAMES = new Set([
+  "node_modules",
+  ".pnpm-store",
+  ".vite",
+  ".cache",
+  ".venv",
+  "venv",
+  "__pycache__",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".ruff_cache",
+  ".tox",
+]);
+
 function normalizedRelative(root: string, candidate: string): string {
   return path.relative(root, candidate).replaceAll("\\", "/");
 }
@@ -300,7 +314,7 @@ export class WorktreeManager {
     const output = await this.git.output(worktree.path, [
       "diff",
       "--name-only",
-      "--diff-filter=ACMR",
+      "--diff-filter=ACMRD",
       `${baseRef}..HEAD`,
     ]);
     return output ? output.split(/\r?\n/).filter(Boolean) : [];
@@ -312,6 +326,81 @@ export class WorktreeManager {
       "--porcelain",
       "--untracked-files=normal",
     ]);
+  }
+
+  async synchronize(
+    worktree: WorktreeRecord,
+    baseRef: string,
+  ): Promise<void> {
+    const dirty = await this.status(worktree);
+    if (dirty) {
+      throw new Error(
+        `Cannot synchronize dirty VEX worktree ${worktree.owner}:\n${dirty}`,
+      );
+    }
+    await this.git.run(worktree.path, ["reset", "--hard", baseRef]);
+    await this.git.run(worktree.path, ["clean", "-fdx"]);
+    worktree.baseRef = baseRef;
+  }
+
+  async checkpoint(worktree: WorktreeRecord, message: string): Promise<string> {
+    await this.pruneUntrackedGeneratedDirectories(worktree);
+    await this.git.run(worktree.path, ["add", "-A"]);
+    await this.git.run(worktree.path, [
+      "-c",
+      "user.name=VEX",
+      "-c",
+      "user.email=vex@localhost",
+      "commit",
+      "-m",
+      message,
+    ]);
+    return this.head(worktree);
+  }
+
+  async pruneUntrackedGeneratedDirectories(
+    worktree: WorktreeRecord,
+  ): Promise<string[]> {
+    const root = path.resolve(worktree.path);
+    const removed: string[] = [];
+    const visit = async (directory: string): Promise<void> => {
+      const entries = await readdir(directory, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory() || entry.isSymbolicLink() || entry.name === ".git") {
+          continue;
+        }
+        const candidate = path.resolve(directory, entry.name);
+        const relative = path.relative(root, candidate);
+        if (
+          !relative ||
+          relative.startsWith("..") ||
+          path.isAbsolute(relative)
+        ) {
+          throw new Error(`Generated directory escapes VEX worktree: ${candidate}`);
+        }
+        const normalized = relative.replaceAll("\\", "/");
+        if (GENERATED_DIRECTORY_NAMES.has(entry.name)) {
+          const tracked = await this.git.output(root, [
+            "ls-files",
+            "--",
+            normalized,
+          ]);
+          if (!tracked) {
+            await rm(candidate, {
+              recursive: true,
+              force: true,
+              maxRetries: 3,
+              retryDelay: 100,
+            });
+            removed.push(normalized);
+            continue;
+          }
+        }
+        await visit(candidate);
+      }
+    };
+    await visit(root);
+    return removed;
   }
 
   async integrate(target: WorktreeRecord, commits: string[]): Promise<void> {

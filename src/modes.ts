@@ -19,12 +19,24 @@ import type {
   RoleRunResult,
   RoleRunner,
   RoleRuntimeConfig,
+  RunTokenUsage,
   ScoutReport,
   VexRunOptions,
 } from "./types.js";
+import {
+  addAgentUsage,
+  formatTokenUsageCompact,
+  initialRunTokenUsage,
+} from "./usage.js";
 import type { WorktreeManager } from "./worktrees.js";
 
-export const VEX_WORK_MODES = ["auto", "chat", "review", "implement"] as const;
+export const VEX_WORK_MODES = [
+  "auto",
+  "chat",
+  "review",
+  "code-review",
+  "implement",
+] as const;
 
 export type VexWorkMode = (typeof VEX_WORK_MODES)[number];
 export type ResolvedWorkMode = Exclude<VexWorkMode, "auto">;
@@ -46,6 +58,7 @@ export interface TechnicalReviewFinding {
 }
 
 export interface TechnicalReviewReport {
+  mode: "technical-review" | "code-review";
   id: string;
   task: string;
   root: string;
@@ -54,6 +67,7 @@ export interface TechnicalReviewReport {
   recommendations: string[];
   provider: string;
   model: string;
+  usage: RunTokenUsage;
   artifactPath: string;
 }
 
@@ -76,21 +90,23 @@ export interface VexModeServiceDependencies {
 }
 
 const CHAT_SYSTEM_PROMPT = `You are VEX Chat, a conversational technical assistant.
-Answer the user directly and naturally. You have no repository, filesystem, shell, or editing tools in this mode. Never claim that you inspected or changed local files. If repository evidence is required, explain that the user can switch to review or implement mode. Match the user's language.`;
+Answer the user directly and naturally. You have no repository, filesystem, shell, or editing tools in this mode. Never claim that you inspected or changed local files. If repository evidence is required, explain that the user can switch to review, code-review, or implement mode. Match the user's language.`;
 
 const MODE_CLASSIFIER_PROMPT = `Classify the user's intended VEX work mode.
 
 - chat: conversation, explanations, conceptual questions, brainstorming, or advice that does not require inspecting the local workspace.
 - review: inspect or analyze the current workspace and report architecture, quality, correctness, security, risks, or recommendations without changing files.
+- code-review: inspect repository code for actionable correctness, security, performance, maintainability, and testing findings without changing files. Use this for explicit code review requests.
 - implement: create, fix, refactor, migrate, test, or otherwise change the workspace.
 
 Safety rules:
 - Requests saying not to modify files, review only, analyze only, or read-only are always review.
+- Explicit code review requests are code-review unless they also ask for changes.
 - If inspection is requested without an explicit change, use review.
 - If the user explicitly asks to change or implement something, use implement even if analysis is also mentioned.
 
 Return only JSON in this shape:
-{"mode":"chat|review|implement","confidence":0.0,"reason":"short reason"}`;
+{"mode":"chat|review|code-review|implement","confidence":0.0,"reason":"short reason"}`;
 
 const TECHNICAL_REVIEW_PROMPT = `You are VEX Technical Reviewer operating in a strictly read-only review mode.
 Inspect the current workspace only with read, ls, find, and grep. You cannot execute commands, edit files, create commits, or delegate work.
@@ -106,6 +122,28 @@ Finish exactly once with team_yield using role "reviewer", status "completed", a
       "title": "finding title",
       "explanation": "evidence, impact, and recommended direction",
       "category": "correctness|architecture|security|testing|maintainability",
+      "file": "optional/path",
+      "line": 1
+    }
+  ],
+  "recommendations": ["ordered next step"]
+}
+Priority is 0 critical through 3 low. Omit file and line when there is no precise location. Match the user's language.`;
+
+const CODE_REVIEW_PROMPT = `You are the built-in VEX Code Reviewer. You are the only Agent in this workflow and operate in strictly read-only mode.
+Inspect the repository directly with read, ls, find, and grep. You cannot execute commands, edit files, create commits, or delegate work. Do not assume that Scout or another Agent supplied context.
+
+Review the requested code scope using concrete repository evidence. Report actionable findings first, ordered by severity. Focus on correctness and regressions, security, performance, maintainability, interface contracts, error handling, and missing tests. Do not describe changes as implemented and do not require a Git diff.
+
+Finish exactly once with team_yield using role "reviewer", status "completed", a concise summary, and this payload:
+{
+  "summary": "overall code review assessment",
+  "findings": [
+    {
+      "priority": 0,
+      "title": "finding title",
+      "explanation": "repository evidence, impact, and recommended direction",
+      "category": "correctness|security|performance|testing|maintainability",
       "file": "optional/path",
       "line": 1
     }
@@ -138,6 +176,34 @@ export function classifyWorkMode(input: string): ModeDecision {
       confidence: 1,
       source: "heuristic",
       reason: "empty input is non-mutating",
+    };
+  }
+
+  const mutationText = text
+    .replace(
+      /(?:不要|无需|不用|禁止|不).{0,8}(?:实现|修复|修改|改造|重构|新增|添加|删除|升级|迁移|开发|补充|写入|提交)/g,
+      "",
+    )
+    .replace(
+      /\b(?:without|do not|don't)\s+(?:making\s+)?(?:changes?|modifying|editing|implementing)\b/g,
+      "",
+    );
+  const mutationRequested = [
+    /(?:实现|修复|修改|改造|重构|新增|添加|删除|升级|迁移|开发|补充|写入|提交)/,
+    /\b(?:implement|fix|refactor|add|remove|update|build|create|migrate|rewrite|change|modify|edit)\b/,
+  ].some((pattern) => pattern.test(mutationText));
+  const codeReviewRequested = [
+    /(?:代码|源码|代码库).{0,8}(?:评审|审查)/,
+    /(?:评审|审查)(?:一下)?(?:当前|本地|这个|现有|该|整个)?(?:项目|仓库)?(?:的)?(?:代码|源码|代码库|仓库)/,
+    /\bcode[- ]review\b/,
+    /\breview(?:\s+the)?(?:\s+(?:current|local|this|existing|entire))?\s+(?:code|repository|repo|codebase)\b/,
+  ].some((pattern) => pattern.test(text));
+  if (codeReviewRequested && !mutationRequested) {
+    return {
+      mode: "code-review",
+      confidence: 0.99,
+      source: "heuristic",
+      reason: "the request explicitly asks for a reviewer-only code review",
     };
   }
 
@@ -201,7 +267,10 @@ export function classifyWorkMode(input: string): ModeDecision {
     patternCount(text, workspacePatterns) * 4;
   const questionScore = patternCount(text, questionPatterns) * 3;
 
-  if (implementationScore >= 4 && implementationScore >= reviewScore) {
+  if (
+    implementationScore >= 4 &&
+    (mutationRequested || implementationScore >= reviewScore)
+  ) {
     return {
       mode: "implement",
       confidence: Math.min(0.98, 0.86 + implementationScore * 0.02),
@@ -313,7 +382,12 @@ export class NativeConversationClient {
     const json = content.match(/\{[\s\S]*\}/)?.[0];
     if (!json) throw new Error("Mode classifier returned no JSON object");
     const parsed = JSON.parse(json) as unknown;
-    if (!isRecord(parsed) || !["chat", "review", "implement"].includes(String(parsed.mode))) {
+    if (
+      !isRecord(parsed) ||
+      !["chat", "review", "code-review", "implement"].includes(
+        String(parsed.mode),
+      )
+    ) {
       throw new Error("Mode classifier returned an invalid mode");
     }
     return {
@@ -435,8 +509,20 @@ function successful(result: RoleRunResult): boolean {
     (result.yield.status === "completed" || result.yield.status === "skipped");
 }
 
-function reviewId(now = new Date()): string {
-  return `review-${now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z")}-${randomUUID().slice(0, 8)}`;
+function reviewId(
+  mode: TechnicalReviewReport["mode"],
+  now = new Date(),
+): string {
+  const prefix = mode === "code-review" ? "code-review" : "review";
+  return `${prefix}-${now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z")}-${randomUUID().slice(0, 8)}`;
+}
+
+function reviewDirectory(homeDirectory: string, root: string, id: string): string {
+  const workspaceKey = createHash("sha256")
+    .update(root.toLowerCase())
+    .digest("hex")
+    .slice(0, 16);
+  return path.join(homeDirectory, ".vex", "reviews", workspaceKey, id);
 }
 
 async function writeJsonAtomic(target: string, value: unknown): Promise<void> {
@@ -555,18 +641,9 @@ export class VexModeService {
     signal?: AbortSignal,
   ): Promise<TechnicalReviewReport> {
     const { root, configuration } = await this.#resolve(cwd, options);
-    const id = reviewId();
-    const workspaceKey = createHash("sha256")
-      .update(root.toLowerCase())
-      .digest("hex")
-      .slice(0, 16);
-    const runDirectory = path.join(
-      this.#homeDirectory,
-      ".vex",
-      "reviews",
-      workspaceKey,
-      id,
-    );
+    const mode = "technical-review" as const;
+    const id = reviewId(mode);
+    const runDirectory = reviewDirectory(this.#homeDirectory, root, id);
     await mkdir(runDirectory, { recursive: true });
 
     const scoutDefinition = readOnlyRole(requireRole(this.#deps.roles, "scout"));
@@ -588,15 +665,78 @@ export class VexModeService {
       },
       signal,
     );
-    await writeJsonAtomic(path.join(runDirectory, "scout-result.json"), scout.yield);
+    const usage = initialRunTokenUsage(configuration.agents);
+    addAgentUsage(usage, "scout", scout.usage);
+    await writeJsonAtomic(
+      path.join(runDirectory, "scout-result.json"),
+      { ...scout.yield, usage: scout.usage },
+    );
     await writeFile(path.join(runDirectory, "scout-log.jsonl"), scout.rawOutput, "utf8");
     if (!successful(scout)) {
       throw new Error(`Technical review scout failed: ${scout.stderr || scout.yield.summary}`);
     }
 
+    return this.#runReviewer(
+      root,
+      configuration,
+      task,
+      mode,
+      id,
+      runDirectory,
+      TECHNICAL_REVIEW_PROMPT,
+      {
+        scout: normalizeScout(scout),
+        constraint:
+          "Report evidence and recommendations only. Do not modify the workspace.",
+      },
+      usage,
+      signal,
+    );
+  }
+
+  async codeReview(
+    cwd: string,
+    task: string,
+    options: VexRunOptions = {},
+    signal?: AbortSignal,
+  ): Promise<TechnicalReviewReport> {
+    const { root, configuration } = await this.#resolve(cwd, options);
+    const mode = "code-review" as const;
+    const id = reviewId(mode);
+    const runDirectory = reviewDirectory(this.#homeDirectory, root, id);
+    await mkdir(runDirectory, { recursive: true });
+    return this.#runReviewer(
+      root,
+      configuration,
+      task,
+      mode,
+      id,
+      runDirectory,
+      CODE_REVIEW_PROMPT,
+      {
+        constraint:
+          "Reviewer-only code review. Inspect directly and do not modify the workspace or delegate.",
+      },
+      initialRunTokenUsage(configuration.agents),
+      signal,
+    );
+  }
+
+  async #runReviewer(
+    root: string,
+    configuration: ResolvedVexConfig,
+    task: string,
+    mode: TechnicalReviewReport["mode"],
+    id: string,
+    runDirectory: string,
+    prompt: string,
+    context: Record<string, unknown>,
+    usage: RunTokenUsage,
+    signal?: AbortSignal,
+  ): Promise<TechnicalReviewReport> {
     const reviewerDefinition = readOnlyRole(
       requireRole(this.#deps.roles, "reviewer"),
-      TECHNICAL_REVIEW_PROMPT,
+      prompt,
     );
     const reviewerRoute = routeFor(configuration, "reviewer");
     const reviewer = await this.#deps.runner.run(
@@ -605,22 +745,17 @@ export class VexModeService {
         role: reviewerDefinition,
         task,
         cwd: root,
-        context: {
-          runDirectory,
-          mode: "technical-review",
-          scout: normalizeScout(scout),
-          constraint:
-            "Report evidence and recommendations only. Do not modify the workspace.",
-        },
+        context: { runDirectory, mode, ...context },
         knowledge: [],
         runtime: reviewerRoute.runtime,
         provider: reviewerRoute.provider,
       },
       signal,
     );
+    addAgentUsage(usage, "reviewer", reviewer.usage);
     await writeJsonAtomic(
       path.join(runDirectory, "reviewer-result.json"),
-      reviewer.yield,
+      { ...reviewer.yield, usage: reviewer.usage },
     );
     await writeFile(
       path.join(runDirectory, "reviewer-log.jsonl"),
@@ -634,17 +769,20 @@ export class VexModeService {
     }
 
     const normalized = normalizeTechnicalReview(reviewer);
-    const artifactPath = path.join(runDirectory, "technical-review.json");
+    const artifactPath = path.join(runDirectory, `${mode}.json`);
     const report: TechnicalReviewReport = {
+      mode,
       id,
       task,
       root,
       ...normalized,
       provider: reviewerRoute.provider.id,
       model: reviewerRoute.runtime.model,
+      usage,
       artifactPath,
     };
     await writeJsonAtomic(artifactPath, report);
+    await writeJsonAtomic(path.join(runDirectory, "usage.json"), usage);
     return report;
   }
 
@@ -679,5 +817,8 @@ export function formatTechnicalReview(report: TechnicalReviewReport): string {
   const recommendations = report.recommendations.length > 0
     ? report.recommendations.map((item) => `- ${item}`).join("\n")
     : "- None.";
-  return `Technical review ${report.id}\n${report.summary}\n\nFindings:\n${findings}\n\nRecommendations:\n${recommendations}\n\nRead-only review: no workspace files were changed.\nArtifact: ${report.artifactPath}`;
+  const label = report.mode === "code-review"
+    ? "Reviewer-only code review"
+    : "Technical review";
+  return `${label} ${report.id}\n${report.summary}\n\nFindings:\n${findings}\n\nRecommendations:\n${recommendations}\n\nUsage: ${formatTokenUsageCompact(report.usage.total)}\nRead-only review: no workspace files were changed.\nArtifact: ${report.artifactPath}`;
 }

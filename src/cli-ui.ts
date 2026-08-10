@@ -6,6 +6,8 @@ import {
   type RoleStatus,
   type VexRunState,
 } from "./types.js";
+import { roleStatusLabel } from "./role-state.js";
+import { formatTokenCount, formatTokenUsageCompact } from "./usage.js";
 
 const colorEnabled = stdout.isTTY && !process.env.NO_COLOR;
 const ansi = {
@@ -44,6 +46,7 @@ function line(label: string, value: string, width: number): string {
 function statusStyle(status: RoleStatus): { icon: string; color: string } {
   if (status === "completed") return { icon: "●", color: ansi.green };
   if (status === "running") return { icon: "◆", color: ansi.cyan };
+  if (status === "waiting") return { icon: "◇", color: ansi.yellow };
   if (status === "skipped") return { icon: "−", color: ansi.dim };
   if (status === "failed" || status === "blocked" || status === "aborted") {
     return { icon: "×", color: ansi.red };
@@ -55,7 +58,14 @@ function roleCard(state: VexRunState, width: number): string[] {
   const cells = MODEL_ROLES.map((role) => {
     const current = state.roles[role];
     const style = statusStyle(current.status);
-    return `${style.color}${style.icon}${ansi.reset} ${role}`;
+    const waiting = current.status === "waiting" && current.waitingFor
+      ? ` · ${current.waitingFor}`
+      : "";
+    const usage = state.usage.agents[role];
+    const tokens = usage.requests > 0
+      ? ` · ${formatTokenCount(usage.totalTokens)} tok`
+      : "";
+    return `${style.color}${style.icon}${ansi.reset} ${role} ${ansi.dim}${roleStatusLabel(current.status)}${waiting}${tokens}${ansi.reset}`;
   });
   const rows: string[] = [];
   const columnWidth = Math.max(20, Math.floor(width / 2));
@@ -105,9 +115,9 @@ export function renderHome(view: HomeView): string {
       line("latest", latest, width),
       `├${"─".repeat(width)}┤`,
       `│${pad(` ${ansi.bold}PROMPT${ansi.reset}`, width)}│`,
-      `│${pad("  Type naturally; auto selects chat, review, or implement.", width)}│`,
-      `│${pad("  Type / for live hints; use Up/Down and Tab to complete.", width)}│`,
-      `│${pad("  /mode auto|chat|review|implement", width)}│`,
+      `│${pad("  Type naturally; auto selects chat, review, code-review, or implement.", width)}│`,
+      `│${pad("  Type / for hints; Up recalls history; Tab completes.", width)}│`,
+      `│${pad("  /mode auto|chat|review|code-review|implement", width)}│`,
       `│${pad("  /provider · /model (two-pane model selector)", width)}│`,
       `│${pad("  /route (per-role routing) · /help · /quit", width)}│`,
       `├${"─".repeat(width)}┤`,
@@ -121,6 +131,7 @@ export function renderDashboard(state: VexRunState): string {
   const width = Math.max(58, Math.min(stdout.columns ?? 92, 112) - 2);
   const latestEvent = state.events.at(-1)?.message ?? "waiting";
   const integration = state.integrationRef?.slice(0, 10) ?? "not created";
+  const usedModels = state.usage.models.filter((usage) => usage.requests > 0);
   const rows = [
     line("run", state.id, width),
     line("goal", state.task, width),
@@ -131,6 +142,19 @@ export function renderDashboard(state: VexRunState): string {
     `├${"─".repeat(width)}┤`,
     `│${pad(` ${ansi.bold}TEAM${ansi.reset}`, width)}│`,
     ...roleCard(state, width),
+    `├${"─".repeat(width)}┤`,
+    `│${pad(` ${ansi.bold}USAGE${ansi.reset}`, width)}│`,
+    line("tokens", formatTokenUsageCompact(state.usage.total), width),
+    ...usedModels.slice(0, 3).map((usage) =>
+      line(
+        "model",
+        `${usage.provider}/${usage.model} · ${formatTokenUsageCompact(usage)}`,
+        width,
+      )
+    ),
+    ...(usedModels.length > 3
+      ? [line("models", `+${usedModels.length - 3} more; use /usage`, width)]
+      : []),
     `├${"─".repeat(width)}┤`,
     line("activity", latestEvent, width),
     line("changes", `${state.changes.length} result(s), ${state.integratedCommits.length} commit(s)`, width),
@@ -164,6 +188,58 @@ export interface LineHint {
 }
 
 export type LineHintProvider = (line: string) => readonly LineHint[];
+
+export class PromptHistory {
+  readonly #limit: number;
+  readonly #entries: string[] = [];
+  #index = 0;
+  #draft = "";
+
+  constructor(limit = 100) {
+    this.#limit = Math.max(1, limit);
+  }
+
+  get browsing(): boolean {
+    return this.#index < this.#entries.length;
+  }
+
+  begin(draft = ""): void {
+    this.#index = this.#entries.length;
+    this.#draft = draft;
+  }
+
+  push(value: string): void {
+    const normalized = value.trim();
+    if (!normalized) return;
+    if (this.#entries.at(-1) !== normalized) this.#entries.push(normalized);
+    if (this.#entries.length > this.#limit) {
+      this.#entries.splice(0, this.#entries.length - this.#limit);
+    }
+    this.begin();
+  }
+
+  previous(current: string): string | undefined {
+    if (this.#entries.length === 0 || this.#index === 0) return undefined;
+    if (this.#index === this.#entries.length) this.#draft = current;
+    this.#index -= 1;
+    return this.#entries[this.#index];
+  }
+
+  next(): string | undefined {
+    if (this.#index >= this.#entries.length) return undefined;
+    this.#index += 1;
+    return this.#index === this.#entries.length
+      ? this.#draft
+      : this.#entries[this.#index];
+  }
+
+  stopBrowsing(): void {
+    this.#index = this.#entries.length;
+    this.#draft = "";
+  }
+}
+
+const interactivePromptHistory = new PromptHistory();
 
 function glyphWidth(glyph: string): number {
   const codePoint = glyph.codePointAt(0) ?? 0;
@@ -248,7 +324,7 @@ function hintRows(
   const fit = (rows: string[]) => rows.map((row) => crop(row, rowWidth));
   if (!lineValue) {
     return fit([
-      `${ansi.dim}  Hint: type / to view commands · Tab completes parameters${ansi.reset}`,
+      `${ansi.dim}  Hint: type / for commands · ↑ recalls history · Tab completes${ansi.reset}`,
     ]);
   }
   if (!lineValue.trimStart().startsWith("/")) return [];
@@ -288,6 +364,7 @@ function hintRows(
 async function readHintedLine(
   prompt: string,
   hintProvider: LineHintProvider,
+  history = interactivePromptHistory,
 ): Promise<string> {
   const wasRaw = stdin.isRaw;
   emitKeypressEvents(stdin);
@@ -300,6 +377,7 @@ async function readHintedLine(
     let activeHint = 0;
     let closed = false;
     let renderScheduled = false;
+    history.begin();
 
     const value = () => glyphs.join("");
     const hints = () => hintProvider(value());
@@ -349,14 +427,26 @@ async function readHintedLine(
         `\x1b[?25l\r\x1b[0J${prompt}${submitted}${interrupted ? "^C" : ""}\r\n`,
       );
       cleanup();
+      if (!interrupted) history.push(submitted);
       resolve(interrupted ? "/quit" : submitted.trim());
     };
     const resetSelection = () => {
       activeHint = 0;
     };
+    const recallHistory = (nextValue: string | undefined) => {
+      if (nextValue === undefined) return false;
+      glyphs = Array.from(nextValue);
+      cursor = glyphs.length;
+      resetSelection();
+      return true;
+    };
+    const stopHistoryBrowsing = () => {
+      history.stopBrowsing();
+    };
     const insert = (characters: readonly string[]) => {
       glyphs.splice(cursor, 0, ...characters);
       cursor += characters.length;
+      stopHistoryBrowsing();
       resetSelection();
     };
     const onKeypress = (character: string | undefined, key: Key) => {
@@ -374,7 +464,15 @@ async function readHintedLine(
         return;
       }
       const currentHints = hints();
-      if (key.name === "up" && currentHints.length > 0) {
+      const useHistory = history.browsing || currentHints.length === 0;
+      if ((key.name === "up" && useHistory) || (key.ctrl && key.name === "p")) {
+        recallHistory(history.previous(value()));
+      } else if (
+        (key.name === "down" && history.browsing) ||
+        (key.ctrl && key.name === "n")
+      ) {
+        recallHistory(history.next());
+      } else if (key.name === "up" && currentHints.length > 0) {
         activeHint = (activeHint - 1 + currentHints.length) % currentHints.length;
       } else if (key.name === "down" && currentHints.length > 0) {
         activeHint = (activeHint + 1) % currentHints.length;
@@ -391,6 +489,7 @@ async function readHintedLine(
           } else {
             glyphs = Array.from(currentHints[activeHint]?.value ?? value());
             cursor = glyphs.length;
+            stopHistoryBrowsing();
             resetSelection();
           }
         }
@@ -404,16 +503,20 @@ async function readHintedLine(
         cursor = glyphs.length;
       } else if (key.name === "backspace") {
         if (cursor > 0) glyphs.splice(--cursor, 1);
+        stopHistoryBrowsing();
         resetSelection();
       } else if (key.name === "delete") {
         if (cursor < glyphs.length) glyphs.splice(cursor, 1);
+        stopHistoryBrowsing();
         resetSelection();
       } else if (key.ctrl && key.name === "u") {
         glyphs.splice(0, cursor);
         cursor = 0;
+        stopHistoryBrowsing();
         resetSelection();
       } else if (key.ctrl && key.name === "k") {
         glyphs.splice(cursor);
+        stopHistoryBrowsing();
         resetSelection();
       } else if (key.ctrl && key.name === "w") {
         while (cursor > 0 && /\s/.test(glyphs[cursor - 1]!)) {
@@ -422,6 +525,7 @@ async function readHintedLine(
         while (cursor > 0 && !/\s/.test(glyphs[cursor - 1]!)) {
           glyphs.splice(--cursor, 1);
         }
+        stopHistoryBrowsing();
         resetSelection();
       } else if (
         character &&

@@ -5,13 +5,16 @@ import {
   type ProjectCommandRunner,
 } from "./command-runner.js";
 import type { RoleKnowledgeClient } from "./knowledge.js";
+import { MAX_TRANSIENT_ROLE_RETRIES } from "./defaults.js";
 import {
   manifestFromArchitect,
   readyImplementationRoles,
   validateExecutionManifest,
 } from "./manifest.js";
 import { FileOwnershipPolicy, matchesOwnedPath } from "./policy.js";
+import { initialRoleState, transitionRoleState } from "./role-state.js";
 import { hashRoleDefinitions } from "./roles.js";
+import { addAgentUsage, initialRunTokenUsage } from "./usage.js";
 import type { RunStateStore } from "./state-store.js";
 import {
   MODEL_ROLES,
@@ -50,9 +53,9 @@ export interface VexOrchestratorDependencies {
   commands?: ProjectCommandRunner;
 }
 
-function initialRoleStates(): Record<ModelRole, RoleState> {
+function initialRoleStates(at: string): Record<ModelRole, RoleState> {
   return Object.fromEntries(
-    MODEL_ROLES.map((role) => [role, { status: "pending", attempts: 0 }]),
+    MODEL_ROLES.map((role) => [role, initialRoleState(at)]),
   ) as Record<ModelRole, RoleState>;
 }
 
@@ -80,8 +83,33 @@ function resultSucceeded(result: RoleRunResult): boolean {
   );
 }
 
+function transientRoleFailure(result: RoleRunResult): string | undefined {
+  if (resultSucceeded(result) || result.yield.status === "blocked") return undefined;
+  const detail = `${result.stderr}\n${result.yield.summary}`.trim();
+  const normalized = detail.toLowerCase();
+  const transient =
+    /(^|\W)terminated(\W|$)/i.test(detail) ||
+    normalized.includes("fetch failed") ||
+    normalized.includes("econnreset") ||
+    normalized.includes("etimedout") ||
+    normalized.includes("socket hang up") ||
+    normalized.includes("connection reset") ||
+    normalized.includes("connection closed") ||
+    normalized.includes("temporarily unavailable") ||
+    normalized.includes("operation was aborted") ||
+    normalized.includes("und_err_") ||
+    /provider http (?:429|5\d\d)\b/i.test(detail) ||
+    /\b(?:http )?429\b.*(?:rate|request)/i.test(detail);
+  if (!transient) return undefined;
+  return result.yield.summary.trim() || result.stderr.trim() || "temporary Provider failure";
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function stringArray(value: unknown): string[] {
@@ -161,7 +189,7 @@ export class VexOrchestrator {
     const hashes = hashRoleDefinitions(this.#deps.roles);
     const now = new Date().toISOString();
     const state: VexRunState = {
-      schemaVersion: 5,
+      schemaVersion: 7,
       id: runId,
       task,
       root: repository.root,
@@ -188,7 +216,8 @@ export class VexOrchestrator {
       createdAt: now,
       updatedAt: now,
       activePid: process.pid,
-      roles: initialRoleStates(),
+      roles: initialRoleStates(now),
+      usage: initialRunTokenUsage(configuration.agents),
       worktrees: [],
       changes: [],
       commandResults: [],
@@ -223,6 +252,8 @@ export class VexOrchestrator {
     try {
       if (!state.scoutReport) {
         await this.#setPhase(state, "discovery", "planning");
+        this.#waitForRole(state, "architect", "Scout repository discovery");
+        await this.#save(state);
         const scout = await this.#runRole(
           state,
           "scout",
@@ -241,23 +272,60 @@ export class VexOrchestrator {
       }
 
       await this.#setPhase(state, "design", "planning");
-      const architect = await this.#runRole(
-        state,
-        "architect",
-        state.executionRoot,
-        { scout: state.scoutReport },
-        signal,
-        state.roles.architect.attempts > 0,
-      );
-      state.manifest = manifestFromArchitect(state.task, architect, {
-        runId: state.id,
-        repoRoot: state.root,
-        baseCommit: state.baseRef,
-        projectCommands: state.configuredProjectCommands,
-        constraints: state.scoutReport.constraints,
-        riskFlags: state.scoutReport.risks,
-        roleDefinitionHashes: state.roleDefinitionHashes,
-      });
+      let manifest: ExecutionManifest | undefined;
+      let validationError: string | undefined;
+      for (let attempt = 0; attempt <= state.maxRepairAttempts; attempt += 1) {
+        const architect = await this.#runRole(
+          state,
+          "architect",
+          state.executionRoot,
+          {
+            scout: state.scoutReport,
+            ...(validationError
+              ? {
+                  manifestValidationError: validationError,
+                  instruction:
+                    "Return a corrected complete execution manifest. Keep writer ownership non-overlapping and use only fixed writer role names in dependencies and integrationOrder.",
+                }
+              : {}),
+          },
+          signal,
+          state.roles.architect.attempts > 0,
+        );
+        try {
+          manifest = manifestFromArchitect(state.task, architect, {
+            runId: state.id,
+            repoRoot: state.root,
+            baseCommit: state.baseRef,
+            projectCommands: state.configuredProjectCommands,
+            constraints: state.scoutReport.constraints,
+            riskFlags: state.scoutReport.risks,
+            roleDefinitionHashes: state.roleDefinitionHashes,
+          });
+          break;
+        } catch (error) {
+          validationError = errorMessage(error);
+          this.#waitForRole(
+            state,
+            "architect",
+            "execution manifest correction",
+          );
+          this.#event(
+            state,
+            "manifest-rejected",
+            `Architect manifest attempt ${attempt + 1} rejected: ${validationError}`,
+            "architect",
+          );
+          await this.#save(state);
+          if (attempt >= state.maxRepairAttempts) {
+            throw new Error(
+              `Architect could not produce a valid execution manifest after ${attempt + 1} attempt(s): ${validationError}`,
+            );
+          }
+        }
+      }
+      if (!manifest) throw new Error("Architect returned no execution manifest");
+      state.manifest = manifest;
       state.securityReview = state.securityReview || state.manifest.securityReview;
       await this.#deps.store.writeArtifact(
         state.root,
@@ -293,6 +361,13 @@ export class VexOrchestrator {
       ]);
       state.phase = "approval";
       state.status = "awaiting-confirmation";
+      for (const assignment of state.manifest.assignments) {
+        this.#waitForRole(
+          state,
+          assignment.role,
+          assignment.skipped ? "approved skip" : "execution approval",
+        );
+      }
       delete state.activePid;
       delete state.error;
       this.#event(
@@ -326,6 +401,21 @@ export class VexOrchestrator {
     state.approvedAt = new Date().toISOString();
     state.activePid = process.pid;
     delete state.error;
+    for (const role of ["backend", "frontend"] as const) {
+      const dependencies = assignmentFor(manifest, role).dependencies;
+      this.#waitForRole(
+        state,
+        role,
+        dependencies.length > 0
+          ? `dependencies: ${dependencies.join(", ")}`
+          : "implementation worktree",
+      );
+    }
+    this.#waitForRole(state, "test-engineer", "backend and frontend delivery");
+    this.#waitForRole(state, "reviewer", "verification");
+    if (state.securityReview) {
+      this.#waitForRole(state, "security-reviewer", "reviewer handoff");
+    }
     this.#event(state, "plan-approved", "User approved the execution manifest");
     await this.#save(state);
 
@@ -357,12 +447,11 @@ export class VexOrchestrator {
           const assignment = assignmentFor(manifest, role);
           if (!assignment.skipped) continue;
           const change = this.#skippedChange(assignment);
-          state.roles[role] = {
-            ...state.roles[role],
-            status: "skipped",
-            summary: assignment.objective,
-            finishedAt: new Date().toISOString(),
-          };
+          state.roles[role] = transitionRoleState(
+            state.roles[role],
+            "skipped",
+            { summary: assignment.objective },
+          );
           skippedChanges.push(change);
         }
 
@@ -517,7 +606,9 @@ export class VexOrchestrator {
       "reviewer",
       "security-reviewer",
     ] as const) {
-      state.roles[role] = { status: "pending", attempts: state.roles[role].attempts };
+      state.roles[role] = transitionRoleState(state.roles[role], "waiting", {
+        waitingFor: "resumed execution",
+      });
     }
     state.phase = "approval";
     state.status = "awaiting-confirmation";
@@ -627,12 +718,11 @@ export class VexOrchestrator {
     const assignment = assignmentFor(manifest, "test-engineer");
     if (assignment.skipped) {
       const change = this.#skippedChange(assignment);
-      state.roles["test-engineer"] = {
-        ...state.roles["test-engineer"],
-        status: "skipped",
-        summary: assignment.objective,
-        finishedAt: new Date().toISOString(),
-      };
+      state.roles["test-engineer"] = transitionRoleState(
+        state.roles["test-engineer"],
+        "skipped",
+        { summary: assignment.objective },
+      );
       state.changes.push(change);
       await this.#writeChange(state, change);
       await this.#save(state);
@@ -704,6 +794,15 @@ export class VexOrchestrator {
     signal?: AbortSignal,
   ): Promise<ReviewCycle> {
     await this.#setPhase(state, "review", "running");
+    this.#waitForRole(state, "reviewer", `review cycle ${attempt + 1}`);
+    if (state.securityReview) {
+      this.#waitForRole(
+        state,
+        "security-reviewer",
+        `reviewer cycle ${attempt + 1}`,
+      );
+    }
+    await this.#save(state);
     const reports: ReviewCycle["reports"] = {};
     const reviewer = await this.#runRole(
       state,
@@ -711,7 +810,7 @@ export class VexOrchestrator {
       integration.path,
       { manifest, changes: state.changes, commandResults: state.commandResults },
       signal,
-      attempt > 0,
+      false,
     );
     reports.reviewer = this.#normalizeReview(reviewer, manifest, "reviewer");
     if (state.securityReview) {
@@ -721,7 +820,7 @@ export class VexOrchestrator {
         integration.path,
         { manifest, changes: state.changes, commandResults: state.commandResults },
         signal,
-        attempt > 0,
+        false,
       );
       reports["security-reviewer"] = this.#normalizeReview(
         security,
@@ -729,11 +828,11 @@ export class VexOrchestrator {
         "security-reviewer",
       );
     } else {
-      state.roles["security-reviewer"] = {
-        ...state.roles["security-reviewer"],
-        status: "skipped",
-        summary: "Security review was not requested",
-      };
+      state.roles["security-reviewer"] = transitionRoleState(
+        state.roles["security-reviewer"],
+        "skipped",
+        { summary: "Security review was not requested" },
+      );
     }
     const findings = Object.values(reports).flatMap((report) => report.findings);
     const approved = Object.values(reports).every((report) => report.approved) &&
@@ -838,18 +937,25 @@ export class VexOrchestrator {
     );
     if (affected.length === 0) throw new Error("Review rejected without routable findings");
     for (const role of affected) {
+      this.#waitForRole(state, role, `repair attempt ${attempt}`);
+    }
+    await this.#save(state);
+    for (const role of affected) {
       const assignment = assignmentFor(manifest, role);
+      const integratedHead = await this.#deps.worktrees.head(integration);
       let worktree = state.worktrees.find((item) => item.owner === role);
       if (!worktree) {
         worktree = await this.#deps.worktrees.create(
           state.executionRoot,
           state.id,
           role,
-          await this.#deps.worktrees.head(integration),
+          integratedHead,
         );
         state.worktrees.push(worktree);
-        await this.#save(state);
+      } else {
+        await this.#deps.worktrees.synchronize(worktree, integratedHead);
       }
+      await this.#save(state);
       const before = await this.#deps.worktrees.head(worktree);
       const result = await this.#runRole(
         state,
@@ -861,7 +967,7 @@ export class VexOrchestrator {
           repairAttempt: attempt,
           findings: findings.filter((finding) => finding.owner === role),
           instruction:
-            "Fix only the routed findings, commit the repair, and preserve assignment ownership.",
+            "Fix only the routed findings and preserve assignment ownership. VEX owns the Git checkpoint after your successful yield.",
         },
         signal,
         true,
@@ -874,7 +980,7 @@ export class VexOrchestrator {
         before,
       );
       if (change.commits.length === 0) {
-        throw new Error(`${role} did not commit a repair for routed findings`);
+        throw new Error(`${role} did not produce a repair for routed findings`);
       }
       this.#enforcePolicy(change, owners, assignment.allowedPaths, role);
       change.changedFiles.forEach((file) => owners.set(file, role));
@@ -893,16 +999,21 @@ export class VexOrchestrator {
     context: Record<string, unknown>,
     signal?: AbortSignal,
     resumeSession = false,
+    transientRetries = 0,
   ): Promise<RoleRunResult> {
     if (signal?.aborted) throw new DOMException("VEX run aborted", "AbortError");
     const previous = state.roles[name];
     const definition = requireRole(this.#deps.roles, name);
-    const readOnlyHead = !definition.writes
-      ? await this.#deps.worktrees.git.output(cwd, ["rev-parse", "HEAD"])
-      : undefined;
+    const attemptHead = await this.#deps.worktrees.git.output(cwd, [
+      "rev-parse",
+      "HEAD",
+    ]);
     const startedAt = new Date().toISOString();
     const attempts = previous.attempts + 1;
-    state.roles[name] = { status: "running", attempts, startedAt };
+    state.roles[name] = transitionRoleState(previous, "running", {
+      at: startedAt,
+      attempts,
+    });
     this.#event(state, "role-started", `${name} attempt ${attempts}`, name);
     await this.#save(state);
     const runDirectory = await this.#deps.store.runDirectory(state.root, state.id);
@@ -933,6 +1044,7 @@ export class VexOrchestrator {
       },
       signal,
     );
+    addAgentUsage(state.usage, name, result.usage);
     if (!definition.writes) {
       const currentHead = await this.#deps.worktrees.git.output(cwd, [
         "rev-parse",
@@ -943,9 +1055,9 @@ export class VexOrchestrator {
         "--porcelain",
         "--untracked-files=normal",
       ]);
-      if (currentHead !== readOnlyHead || dirty) {
+      if (currentHead !== attemptHead || dirty) {
         throw new Error(
-          `${name} violated read-only policy${currentHead !== readOnlyHead ? ` by moving HEAD to ${currentHead}` : ""}${dirty ? `:\n${dirty}` : ""}`,
+          `${name} violated read-only policy${currentHead !== attemptHead ? ` by moving HEAD to ${currentHead}` : ""}${dirty ? `:\n${dirty}` : ""}`,
         );
       }
     }
@@ -959,18 +1071,58 @@ export class VexOrchestrator {
       state.root,
       state.id,
       `results/${name}-${attempts}.json`,
-      result.yield,
+      { ...result.yield, usage: result.usage },
     );
-    state.roles[name] = {
-      status: resultSucceeded(result) ? result.yield.status : "failed",
+    const transientFailure = signal?.aborted
+      ? undefined
+      : transientRoleFailure(result);
+    const maxTransientRetries = MAX_TRANSIENT_ROLE_RETRIES;
+    if (transientFailure && transientRetries < maxTransientRetries) {
+      const currentHead = await this.#deps.worktrees.git.output(cwd, [
+        "rev-parse",
+        "HEAD",
+      ]);
+      const dirty = await this.#deps.worktrees.git.output(cwd, [
+        "status",
+        "--porcelain",
+        "--untracked-files=normal",
+      ]);
+      if (currentHead === attemptHead && !dirty) {
+        const retryNumber = transientRetries + 1;
+        const waitingFor = `transient Provider retry ${retryNumber}/${maxTransientRetries}: ${transientFailure}`;
+        state.roles[name] = transitionRoleState(state.roles[name], "waiting", {
+          attempts,
+          waitingFor,
+        });
+        this.#event(
+          state,
+          "role-retry-scheduled",
+          `${name} waiting for ${waitingFor}`,
+          name,
+        );
+        await this.#save(state);
+        return this.#runRole(
+          state,
+          name,
+          cwd,
+          context,
+          signal,
+          true,
+          retryNumber,
+        );
+      }
+    }
+    const succeeded = resultSucceeded(result);
+    const finalStatus = succeeded
+      ? result.yield.status
+      : result.yield.status === "blocked"
+        ? "blocked"
+        : "failed";
+    state.roles[name] = transitionRoleState(state.roles[name], finalStatus, {
       attempts,
-      startedAt,
-      finishedAt: new Date().toISOString(),
       summary: result.yield.summary,
-      ...(resultSucceeded(result)
-        ? {}
-        : { error: result.stderr || result.yield.summary }),
-    };
+      ...(succeeded ? {} : { error: result.stderr || result.yield.summary }),
+    });
     this.#event(
       state,
       "role-finished",
@@ -989,8 +1141,20 @@ export class VexOrchestrator {
     attempt: number,
     baseline = worktree.baseRef,
   ): Promise<ChangeResult> {
-    const dirty = await this.#deps.worktrees.status(worktree);
-    if (dirty) throw new Error(`${assignment.role} left uncommitted changes:\n${dirty}`);
+    let dirty = await this.#deps.worktrees.status(worktree);
+    if (dirty && result.yield.status === "completed") {
+      const delivery = attempt > 0 ? `repair ${attempt}` : "delivery";
+      await this.#deps.worktrees.checkpoint(
+        worktree,
+        `VEX ${assignment.role} ${delivery}`,
+      );
+      dirty = await this.#deps.worktrees.status(worktree);
+    }
+    if (dirty) {
+      throw new Error(
+        `${assignment.role} left changes after a ${result.yield.status} yield:\n${dirty}`,
+      );
+    }
     const commits = await this.#deps.worktrees.commitsBetween(worktree, baseline);
     const changedFiles = await this.#deps.worktrees.changedFilesBetween(
       worktree,
@@ -1092,6 +1256,22 @@ export class VexOrchestrator {
     );
   }
 
+  #waitForRole(
+    state: VexRunState,
+    role: ModelRole,
+    waitingFor: string,
+  ): void {
+    const current = state.roles[role];
+    if (
+      current.status === "running" ||
+      current.status === "failed" ||
+      current.status === "aborted" ||
+      current.status === "blocked"
+    ) return;
+    state.roles[role] = transitionRoleState(current, "waiting", { waitingFor });
+    this.#event(state, "role-waiting", `${role} waiting for ${waitingFor}`, role);
+  }
+
   async #setPhase(
     state: VexRunState,
     phase: VexRunState["phase"],
@@ -1128,6 +1308,12 @@ export class VexOrchestrator {
         "events.json",
         state.events,
       );
+      await this.#deps.store.writeArtifact(
+        state.root,
+        state.id,
+        "usage.json",
+        state.usage,
+      );
     });
     this.#saveQueues.set(state.id, next);
     try {
@@ -1149,13 +1335,24 @@ export class VexOrchestrator {
     delete state.activePid;
     state.error = error instanceof Error ? error.message : String(error);
     state.reviewsApproved = false;
+    const finishedAt = new Date().toISOString();
     for (const role of MODEL_ROLES) {
       if (state.roles[role].status === "running") {
-        state.roles[role] = {
-          ...state.roles[role],
-          status: aborted ? "aborted" : "failed",
-          finishedAt: new Date().toISOString(),
-        };
+        state.roles[role] = transitionRoleState(
+          state.roles[role],
+          aborted ? "aborted" : "failed",
+          { at: finishedAt, error: state.error },
+        );
+      } else if (state.roles[role].status === "waiting") {
+        state.roles[role] = transitionRoleState(
+          state.roles[role],
+          aborted ? "aborted" : "blocked",
+          {
+            at: finishedAt,
+            summary: "Run stopped before this Agent could continue",
+            error: state.error,
+          },
+        );
       }
     }
     this.#event(state, aborted ? "run-aborted" : "run-failed", state.error);

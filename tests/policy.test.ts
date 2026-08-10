@@ -54,4 +54,15 @@ describe("FileOwnershipPolicy", () => {
       )[0]?.rule,
     ).toBe("assignment-boundary");
   });
+
+  test("treats explicit manifest ownership as authoritative", () => {
+    expect(
+      policy.check(
+        "frontend",
+        ["frontend/src/api/client.ts"],
+        new Map(),
+        ["frontend/**"],
+      ),
+    ).toEqual([]);
+  });
 });

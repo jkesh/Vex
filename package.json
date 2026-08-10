@@ -1,7 +1,7 @@
 {
   "name": "vex-agent-cli",
-  "version": "0.7.3",
-  "description": "Independent adaptive chat, review, and multi-agent engineering CLI",
+  "version": "0.8.0",
+  "description": "Independent adaptive chat, code review, and multi-agent engineering CLI",
   "type": "module",
   "license": "Apache-2.0",
   "repository": {
@@ -38,6 +38,7 @@
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "npm run clean && tsc -p tsconfig.build.json",
+    "setup": "npm install && npm run build && npm link",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "check": "bun run typecheck && bun test && bun run build",

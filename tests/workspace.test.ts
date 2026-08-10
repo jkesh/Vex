@@ -78,4 +78,75 @@ describe("directory workspace mode", () => {
       kind: "directory",
     });
   });
+
+  test("prunes only untracked dependency directories before a checkpoint", async () => {
+    const parent = await mkdtemp(path.join(os.tmpdir(), "vex-checkpoint-"));
+    temporaryDirectories.push(parent);
+    const root = path.join(parent, "workspace");
+    await mkdir(root);
+    await writeFile(path.join(root, "README.md"), "fixture\n", "utf8");
+    const worktrees = new WorktreeManager(
+      undefined,
+      path.join(parent, "worktrees"),
+      path.join(parent, "managed"),
+    );
+    const repository = await worktrees.prepareRepository(root, "checkpoint-run");
+    await mkdir(
+      path.join(repository.executionRoot, "vendor", "node_modules"),
+      { recursive: true },
+    );
+    await writeFile(
+      path.join(repository.executionRoot, "vendor", "node_modules", "tracked.txt"),
+      "tracked\n",
+      "utf8",
+    );
+    await worktrees.git.run(repository.executionRoot, [
+      "add",
+      "-f",
+      "vendor/node_modules/tracked.txt",
+    ]);
+    await worktrees.git.run(repository.executionRoot, [
+      "-c",
+      "user.name=VEX Test",
+      "-c",
+      "user.email=vex@example.test",
+      "commit",
+      "-m",
+      "tracked dependency fixture",
+    ]);
+    const baseRef = await worktrees.git.output(repository.executionRoot, [
+      "rev-parse",
+      "HEAD",
+    ]);
+    const writer = await worktrees.create(
+      repository.executionRoot,
+      "checkpoint-run",
+      "test-engineer",
+      baseRef,
+    );
+    await mkdir(path.join(writer.path, "tests", "node_modules", "package"), {
+      recursive: true,
+    });
+    await writeFile(
+      path.join(writer.path, "tests", "node_modules", "package", "index.js"),
+      "generated\n",
+      "utf8",
+    );
+    await writeFile(path.join(writer.path, "tests", "api.test.js"), "// test\n", "utf8");
+
+    await worktrees.checkpoint(writer, "test delivery");
+
+    await expect(
+      readFile(path.join(writer.path, "tests", "node_modules", "package", "index.js")),
+    ).rejects.toThrow();
+    expect(
+      (await readFile(
+        path.join(writer.path, "vendor", "node_modules", "tracked.txt"),
+        "utf8",
+      )).replaceAll("\r\n", "\n"),
+    ).toBe("tracked\n");
+    expect(await worktrees.changedFilesBetween(writer, baseRef)).toEqual([
+      "tests/api.test.js",
+    ]);
+  });
 });

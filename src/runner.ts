@@ -14,6 +14,11 @@ import {
   type RoleRunResult,
   type RoleYield,
 } from "./types.js";
+import {
+  createAgentTokenUsage,
+  recordProviderRequest,
+  recordProviderResponse,
+} from "./usage.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -29,6 +34,24 @@ function compactContext(
     : `${json.slice(0, maxCharacters)}\n... context truncated by VEX`;
 }
 
+const INTERNAL_CONTEXT_KEYS = new Set([
+  "repositoryroot",
+  "reporoot",
+  "rundirectory",
+  "executionroot",
+  "sourceroot",
+]);
+
+function agentVisibleContext(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(agentVisibleContext);
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => !INTERNAL_CONTEXT_KEYS.has(key.toLowerCase()))
+      .map(([key, nested]) => [key, agentVisibleContext(nested)]),
+  );
+}
+
 function systemPrompt(input: RoleRunInput): string {
   const knowledge = input.knowledge.length
     ? input.knowledge
@@ -38,11 +61,12 @@ function systemPrompt(input: RoleRunInput): string {
         })
         .join("\n\n")
     : "No external role knowledge was returned.";
-  return `${input.role.systemPrompt}\n\n## VEX Runtime\nRun: ${input.runId}\nRole: ${input.role.name}\nModel: ${input.runtime.model}\nThinking: ${input.runtime.thinking}\nWorktree: ${input.cwd}\n\n## Role Knowledge\n${knowledge}\n\nYou are running inside VEX's native agent runtime. Use only the supplied tools. Never invent tool results. Finish exactly once with team_yield.`;
+  return `${input.role.systemPrompt}\n\n## VEX Runtime\nRun: ${input.runId}\nRole: ${input.role.name}\nModel: ${input.runtime.model}\nThinking: ${input.runtime.thinking}\nWorktree: ${input.cwd}\n\n## Role Knowledge\n${knowledge}\n\nYou are running inside VEX's native agent runtime. Use only the supplied tools. The Worktree above is the repository root even when its final directory name matches your role. Every write path must remain repository-relative and match assignment.allowedPaths exactly; never strip the allowed-path prefix or target an original/source workspace. Never invent tool results. Finish exactly once with team_yield.`;
 }
 
 function userPrompt(input: RoleRunInput): string {
-  return `Task: ${input.task}\n\nVEX context:\n${compactContext(input.context)}`;
+  const context = agentVisibleContext(input.context) as Record<string, unknown>;
+  return `Task: ${input.task}\n\nVEX context:\n${compactContext(context)}`;
 }
 
 export function parseRoleYield(
@@ -115,6 +139,7 @@ function failure(
   input: RoleRunInput,
   summary: string,
   rawOutput: string,
+  usage: RoleRunResult["usage"],
 ): RoleRunResult {
   return {
     role: input.role.name,
@@ -127,6 +152,7 @@ function failure(
     },
     stderr: summary,
     rawOutput,
+    usage,
   };
 }
 
@@ -178,10 +204,15 @@ export class NativeAgentRunner {
     }
     messages.push({ role: "user", content: userPrompt(input) });
     let rawOutput = "";
+    const usage = createAgentTokenUsage(
+      input.runtime.provider,
+      input.runtime.model,
+    );
     try {
       for (let turn = 1; turn <= input.provider.maxAgentTurns; turn++) {
         if (signal?.aborted) throw new DOMException("VEX run aborted", "AbortError");
         compactSession(messages);
+        recordProviderRequest(usage);
         const completion = await completeProvider({
           provider: input.provider,
           model: input.runtime.model,
@@ -194,6 +225,7 @@ export class NativeAgentRunner {
           ...(signal ? { signal } : {}),
           sessionId: input.runId,
         });
+        recordProviderResponse(usage, completion.usage);
         const content = completion.content;
         const calls = completion.toolCalls;
         const assistant: ProviderMessage = {
@@ -205,7 +237,7 @@ export class NativeAgentRunner {
             : {}),
         };
         messages.push(assistant);
-        rawOutput += `${JSON.stringify({ turn, type: "assistant", content, tools: calls.map((call) => call.function.name) })}\n`;
+        rawOutput += `${JSON.stringify({ turn, type: "assistant", content, tools: calls.map((call) => call.function.name), usage: completion.usage ?? null })}\n`;
         if (calls.length === 0) {
           messages.push({
             role: "user",
@@ -245,6 +277,7 @@ export class NativeAgentRunner {
               yield: roleYield,
               stderr: "",
               rawOutput,
+              usage,
             };
           }
           let toolResult: string;
@@ -271,6 +304,7 @@ export class NativeAgentRunner {
         input,
         `Agent exceeded ${input.provider.maxAgentTurns} turns without team_yield`,
         rawOutput,
+        usage,
       );
     } catch (error) {
       if (signal?.aborted) throw new DOMException("VEX run aborted", "AbortError");
@@ -278,6 +312,7 @@ export class NativeAgentRunner {
         input,
         error instanceof Error ? error.message : String(error),
         rawOutput,
+        usage,
       );
     }
   }

@@ -31,6 +31,9 @@ import {
   OPENAI_OAUTH_ISSUER,
 } from "./openai-oauth.js";
 import {
+  DEFAULT_MAX_REPAIR_ATTEMPTS,
+} from "./defaults.js";
+import {
   formatResolvedConfig,
   VexConfigLoader,
 } from "./config.js";
@@ -56,6 +59,7 @@ import {
 import {
   formatExecutionPlan,
   formatRunState,
+  formatUsageState,
   type ActiveVexRun,
   VexService,
 } from "./service.js";
@@ -77,9 +81,11 @@ export type CliCommand =
   | "auto"
   | "chat"
   | "assess"
+  | "code-review"
   | "run"
   | "plan"
   | "status"
+  | "usage"
   | "diff"
   | "resume"
   | "review"
@@ -109,9 +115,11 @@ const COMMANDS = new Set<CliCommand>([
   "auto",
   "chat",
   "assess",
+  "code-review",
   "run",
   "plan",
   "status",
+  "usage",
   "diff",
   "resume",
   "review",
@@ -292,6 +300,9 @@ export function parseInteractiveInput(input: string): InteractiveInput {
   if (command === "/assess" || command === "/inspect") {
     return interactiveInvocation("assess", argument ? [argument] : []);
   }
+  if (command === "/code-review") {
+    return interactiveInvocation("code-review", argument ? [argument] : []);
+  }
   if (command === "/plan") {
     return interactiveInvocation("plan", argument ? [argument] : []);
   }
@@ -302,6 +313,7 @@ export function parseInteractiveInput(input: string): InteractiveInput {
   }
   if (
     command === "/status" ||
+    command === "/usage" ||
     command === "/diff" ||
     command === "/resume" ||
     command === "/review" ||
@@ -334,17 +346,20 @@ export function parseInteractiveInput(input: string): InteractiveInput {
 }
 
 export function interactiveHelp(): string {
-  return `Enter natural language directly. VEX routes it to chat, review, or implementation.
-Type / for live command hints. Use Up/Down to choose and Tab to complete commands or their Provider, mode, role, and model arguments.
+  return `Enter natural language directly. VEX routes it to chat, review, code review, or implementation.
+Type / for live command hints. Use Up/Down to choose and Tab to complete commands or their Provider, mode, role, and model arguments. At a normal prompt, Up recalls history.
 
-  /mode [mode]       select auto, chat, review, or implement
+  /mode [mode]       select auto, chat, review, code-review, or implement
   /auto <prompt>     classify this prompt and choose a mode
   /chat <message>    pure conversation; no workspace tools
   /assess <scope>    read-only technical review of this workspace
+  /code-review <scope>
+                     reviewer-only read-only code review; no Scout
   /plan <task>       create a plan without starting writers
   /run <task>        explicitly use the implementation workflow
   /security <task>   run with Security Reviewer enabled
   /status [run-id]   show the latest or selected run
+  /usage [run-id]    show Token use by Agent, Provider, and model
   /diff [run-id]     inspect the integration diff
   /resume [run-id]   continue a persisted run
   /review [run-id]   rerun reviewers
@@ -372,10 +387,12 @@ const INTERACTIVE_COMMAND_COMPLETIONS = [
   "/auto ",
   "/chat ",
   "/assess ",
+  "/code-review ",
   "/plan ",
   "/run ",
   "/security ",
   "/status ",
+  "/usage ",
   "/diff ",
   "/resume ",
   "/review ",
@@ -398,10 +415,11 @@ const INTERACTIVE_COMMAND_COMPLETIONS = [
 const INTERACTIVE_COMMAND_DESCRIPTIONS: Record<string, string> = {
   "/provider": "choose a Provider and authenticate when required",
   "/model": "assign Provider/models to targets; Esc when done",
-  "/mode": "select auto, chat, review, or implement",
+  "/mode": "select auto, chat, review, code-review, or implement",
   "/route": "assign Provider/models to Agent roles; Esc when done",
   "/chat": "one pure conversation turn without workspace tools",
   "/assess": "one read-only technical review",
+  "/code-review": "review repository code with only the Reviewer role",
   "/auto": "classify one prompt and choose its work mode",
   "/run": "start the implementation workflow",
   "/plan": "create a plan without starting writers",
@@ -412,6 +430,7 @@ const INTERACTIVE_COMMAND_DESCRIPTIONS: Record<string, string> = {
   "/logout": "remove a saved Provider login",
   "/config": "show resolved Provider and role configuration",
   "/status": "show the latest or selected run",
+  "/usage": "show Token use by Agent, Provider, and model",
   "/diff": "inspect an integration diff",
   "/resume": "continue a persisted run",
   "/review": "rerun technical reviewers",
@@ -430,6 +449,7 @@ const INTERACTIVE_HINT_PRIORITY = [
   "/mode",
   "/route",
   "/chat",
+  "/code-review",
   "/assess",
   "/run",
   "/help",
@@ -439,6 +459,7 @@ const INTERACTIVE_HINT_PRIORITY = [
   "/plan",
   "/security",
   "/status",
+  "/usage",
   "/diff",
   "/resume",
   "/review",
@@ -649,13 +670,15 @@ function help(): string {
 
 Usage:
   vex                         open the interactive workspace
-  vex <prompt>                semantically select chat, review, or implement
+  vex <prompt>                semantically select chat, review, code review, or implement
   vex chat <message>          pure conversation without workspace access
   vex assess <scope>          read-only technical review
+  vex code-review <scope>     read-only review using only Reviewer
   vex run <task>              plan, confirm, and execute
   vex code <task>             alias for run
   vex plan <task>             create a plan without writers
   vex status [run-id]         show a persisted run
+  vex usage [run-id]          show Token use by Agent, Provider, and model
   vex diff [run-id]           show the integration diff
   vex resume [run-id]         resume a plan or interrupted run
   vex review [run-id]         rerun reviewers
@@ -770,9 +793,10 @@ const ROLE_DESCRIPTIONS: Record<ModelRole, string> = {
 };
 
 const MODE_DESCRIPTIONS: Record<VexWorkMode, string> = {
-  auto: "infer chat, review, or implementation from each prompt",
+  auto: "infer chat, review, code review, or implementation from each prompt",
   chat: "conversation only; no workspace access or changes",
   review: "read-only Scout and Technical Reviewer",
+  "code-review": "read-only Reviewer only; no Scout or writers",
   implement: "full multi-agent plan, implementation, review, and merge gate",
 };
 
@@ -1373,6 +1397,7 @@ function applyInteractiveRouting(
     invocation.command !== "auto" &&
     invocation.command !== "chat" &&
     invocation.command !== "assess" &&
+    invocation.command !== "code-review" &&
     invocation.command !== "config"
   ) {
     return invocation;
@@ -1427,9 +1452,11 @@ async function interactive(runtime: Runtime, cwd: string): Promise<void> {
     if (action.kind === "prompt") {
       const command: CliCommand = mode === "review"
         ? "assess"
-        : mode === "implement"
-          ? "run"
-          : mode;
+        : mode === "code-review"
+          ? "code-review"
+          : mode === "implement"
+            ? "run"
+            : mode;
       try {
         await execute(
           runtime,
@@ -1471,7 +1498,7 @@ async function interactive(runtime: Runtime, cwd: string): Promise<void> {
         if (!selected) continue;
         if (!VEX_WORK_MODES.includes(selected)) {
           throw new Error(
-            `Unknown mode: ${action.mode}. Use auto, chat, review, or implement.`,
+            `Unknown mode: ${action.mode}. Use auto, chat, review, code-review, or implement.`,
           );
         }
         mode = selected;
@@ -1664,7 +1691,7 @@ async function initializeConfig(cwd: string, global: boolean): Promise<string> {
     "backend": { "provider": "local", "model": "your-coding-model" }
   },
   "maxParallelWriters": 2,
-  "maxRepairAttempts": 2,
+  "maxRepairAttempts": ${DEFAULT_MAX_REPAIR_ATTEMPTS},
   "projectCommands": []
 }
 `;
@@ -1837,7 +1864,8 @@ async function execute(
   if (
     invocation.command === "auto" ||
     invocation.command === "chat" ||
-    invocation.command === "assess"
+    invocation.command === "assess" ||
+    invocation.command === "code-review"
   ) {
     const prompt = invocation.values.join(" ").trim();
     if (!prompt) throw new Error(`vex ${invocation.command} requires a prompt`);
@@ -1845,7 +1873,9 @@ async function execute(
       ? "auto"
       : invocation.command === "chat"
         ? "chat"
-        : "review";
+        : invocation.command === "assess"
+          ? "review"
+          : "code-review";
     if (requestedMode === "auto" && process.stdout.isTTY) {
       process.stdout.write("VEX mode: detecting intent…\n");
     }
@@ -1898,6 +1928,23 @@ async function execute(
       process.stdout.write(`\n${formatTechnicalReview(report)}\n`);
       return;
     }
+    if (decision.mode === "code-review") {
+      process.stdout.write(
+        "Starting reviewer-only read-only code review…\n",
+      );
+      const report = await runtime.modes.codeReview(cwd, prompt, {
+        projectTrusted: invocation.options.projectTrusted ?? false,
+        ...(invocation.options.model ? { model: invocation.options.model } : {}),
+        ...(invocation.options.provider
+          ? { provider: invocation.options.provider }
+          : {}),
+        ...(invocation.options.roleRoutes
+          ? { roleRoutes: invocation.options.roleRoutes }
+          : {}),
+      });
+      process.stdout.write(`\n${formatTechnicalReview(report)}\n`);
+      return;
+    }
     await execute(runtime, cwd, { ...invocation, command: "run" });
     return;
   }
@@ -1938,6 +1985,16 @@ async function execute(
       invocation.options.json
         ? `${JSON.stringify(state, null, 2)}\n`
         : `${process.stdout.isTTY ? renderDashboard(state) : formatRunState(state)}\n`,
+    );
+    return;
+  }
+  if (invocation.command === "usage") {
+    const state = await runtime.service.status(cwd, id);
+    if (!state) throw new Error("No VEX runs found");
+    process.stdout.write(
+      invocation.options.json
+        ? `${JSON.stringify(state.usage, null, 2)}\n`
+        : `${formatUsageState(state)}\n`,
     );
     return;
   }

@@ -23,7 +23,7 @@ async function fixture(writes = true): Promise<RoleRunInput> {
       description: "fixture",
       stage: writes ? "implementation" : "discovery",
       tools: writes
-        ? ["read", "bash", "edit", "write", "team_yield"]
+        ? ["read", "bash", "edit", "write", "delete", "team_yield"]
         : ["read", "bash", "team_yield"],
       writes,
       spawns: [],
@@ -114,5 +114,93 @@ describe("native agent tools", () => {
     await expect(
       tools.execute("bash", { command: "curl https://example.com" }, input),
     ).rejects.toThrow("network access");
+  });
+
+  test("confines shell paths to the assigned worktree", async () => {
+    const input = await fixture();
+    const tools = new NativeAgentToolExecutor();
+    const outside = path.join(path.dirname(input.cwd), "source-workspace");
+    await expect(
+      tools.execute(
+        "bash",
+        { command: `npm --prefix "${outside}" install` },
+        input,
+      ),
+    ).rejects.toThrow("outside the assigned worktree");
+    await expect(
+      tools.execute("bash", { command: "cd .. && npm test" }, input),
+    ).rejects.toThrow("cannot traverse outside the assigned worktree");
+    await expect(
+      tools.execute(
+        "bash",
+        { command: 'robocopy "backend\\backend" "." /E /MOVE' },
+        input,
+      ),
+    ).rejects.toThrow("direct shell file writes are blocked");
+    expect(
+      await tools.execute(
+        "bash",
+        {
+          command:
+            'node -e "const values=[1]; console.log(values.map(value=>value+1), 2 >= 1)"',
+        },
+        input,
+      ),
+    ).toContain("exit=0");
+    await expect(
+      tools.execute("bash", { command: "git add -A" }, input),
+    ).rejects.toThrow("VEX owns Git mutations");
+    await expect(
+      tools.execute("bash", { command: "npm install" }, input),
+    ).rejects.toThrow("package-manager commands must run inside");
+    await expect(
+      tools.execute(
+        "bash",
+        { command: "npx vitest run --config tests/vitest.config.ts" },
+        input,
+      ),
+    ).rejects.toThrow("package-manager commands must run inside");
+    await expect(
+      tools.execute("bash", { command: "bunx vitest run" }, input),
+    ).rejects.toThrow("package-manager commands must run inside");
+    await writeFile(
+      path.join(input.cwd, "package.json"),
+      '{"name":"fixture","private":true}\n',
+      "utf8",
+    );
+    expect(
+      await tools.execute("bash", { command: "npm prefix" }, input),
+    ).toContain("exit=0");
+  });
+
+  test("deletes only files owned by the writer assignment", async () => {
+    const input = await fixture();
+    const tools = new NativeAgentToolExecutor();
+    await tools.execute(
+      "write",
+      { path: "src/temporary.js", content: "temporary\n" },
+      input,
+    );
+    expect(
+      await tools.execute("delete", { path: "src/temporary.js" }, input),
+    ).toContain("deleted src/temporary.js");
+    await expect(readFile(path.join(input.cwd, "src/temporary.js"), "utf8"))
+      .rejects.toThrow();
+    await writeFile(path.join(input.cwd, "outside.txt"), "keep\n", "utf8");
+    await expect(
+      tools.execute("delete", { path: "outside.txt" }, input),
+    ).rejects.toThrow("outside this role's allowed paths");
+  });
+
+  test("terminates shell commands at the Provider timeout", async () => {
+    const input = await fixture();
+    input.provider.timeoutMs = 1_000;
+    const tools = new NativeAgentToolExecutor();
+    const result = await tools.execute(
+      "bash",
+      { command: "node -e \"setInterval(function(){}, 1000)\"" },
+      input,
+    );
+    expect(result).toContain("command exceeded 1000ms");
   });
 });

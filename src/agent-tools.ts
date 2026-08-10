@@ -1,4 +1,5 @@
-import { readdir, readFile, stat, writeFile, mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { readdir, readFile, stat, unlink, writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { ShellProjectCommandRunner } from "./command-runner.js";
 import { matchesOwnedPath } from "./policy.js";
@@ -117,6 +118,19 @@ const definitions: Record<string, AgentToolDefinition> = {
           all: { type: "boolean" },
         },
         required: ["path", "oldText", "newText"],
+        additionalProperties: false,
+      },
+    },
+  },
+  delete: {
+    type: "function",
+    function: {
+      name: "delete",
+      description: "Delete one file inside the assignment paths.",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string" } },
+        required: ["path"],
         additionalProperties: false,
       },
     },
@@ -267,9 +281,115 @@ function globRegex(pattern: string): RegExp {
   return new RegExp(`^${expression}$`, "i");
 }
 
-function shellPolicy(command: string, writes: boolean): string | undefined {
+function isWithinDirectory(root: string, target: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(target));
+  return relative === "" ||
+    (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function shellPathViolation(command: string, cwd: string): string | undefined {
+  if (/(?:^|[\s"'=;(])\.\.(?:[\\/]|(?=$|[\s"');&|]))/.test(command)) {
+    return "shell paths cannot traverse outside the assigned worktree";
+  }
+  const candidates: string[] = [];
+  if (process.platform === "win32") {
+    for (const match of command.matchAll(
+      /(?:^|[\s"'=(])([a-z]:[\\/][^"';&|\r\n]*)/gi,
+    )) {
+      if (match[1]) candidates.push(match[1].trim());
+    }
+    for (const match of command.matchAll(
+      /(?:^|[\s"'=(])(\\\\[^"';&|\r\n]*)/g,
+    )) {
+      if (match[1]) candidates.push(match[1].trim());
+    }
+    if (/\b(?:cd|pushd)\s+(?:\/d\s+)?["']?[\\/](?![\\/])/i.test(command)) {
+      return "shell paths cannot be rooted outside the assigned worktree";
+    }
+  } else {
+    for (const match of command.matchAll(
+      /(?:^|[\s"'=(])(\/(?!\/)[^"';&|\r\n]*)/g,
+    )) {
+      if (match[1]) candidates.push(match[1].trim());
+    }
+  }
+  const external = candidates.find((candidate) =>
+    !isWithinDirectory(cwd, candidate)
+  );
+  return external
+    ? `shell path is outside the assigned worktree: ${external}`
+    : undefined;
+}
+
+function ownedCommandRoots(input: RoleRunInput): string[] {
+  return allowedPaths(input).map((pattern) => {
+    const normalized = pattern.replaceAll("\\", "/");
+    const wildcard = normalized.search(/[?*[\]{}]/);
+    const literal = (wildcard >= 0 ? normalized.slice(0, wildcard) : normalized)
+      .replace(/\/+$/, "");
+    const relative = wildcard < 0 && literal
+      ? path.posix.dirname(literal)
+      : literal || ".";
+    return path.resolve(input.cwd, relative);
+  });
+}
+
+function shellCwdBefore(command: string, offset: number, cwd: string): string {
+  let current = path.resolve(cwd);
+  const prefix = command.slice(0, offset);
+  for (const match of prefix.matchAll(
+    /(?:^|[;&|]\s*)cd(?:\s+\/d)?\s+(?:"([^"]+)"|'([^']+)'|([^;&|\s]+))/gi,
+  )) {
+    const raw = match[1] ?? match[2] ?? match[3];
+    if (!raw) continue;
+    current = path.isAbsolute(raw)
+      ? path.resolve(raw)
+      : path.resolve(current, raw);
+  }
+  return current;
+}
+
+function packageManagerScopeViolation(
+  command: string,
+  input: RoleRunInput,
+): string | undefined {
+  const roots = ownedCommandRoots(input);
+  for (const match of command.matchAll(
+    /\b(?:npm|npx|pnpm|yarn|bun|bunx)(?:\.cmd)?\b/gi,
+  )) {
+    if (match.index === undefined) continue;
+    const remainder = command.slice(match.index + match[0].length);
+    if (/^\s+(?:--version|-v|--help|help)\b/i.test(remainder)) continue;
+    const segment = command.slice(match.index).split(/&&|[;|]/, 1)[0] ?? "";
+    const option = /--(?:prefix|cwd|dir)(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^;&|\s]+))/i.exec(
+      segment,
+    );
+    const base = shellCwdBefore(command, match.index, input.cwd);
+    const rawTarget = option?.[1] ?? option?.[2] ?? option?.[3];
+    const target = rawTarget
+      ? path.isAbsolute(rawTarget)
+        ? path.resolve(rawTarget)
+        : path.resolve(base, rawTarget)
+      : base;
+    const owned = roots.some((root) => isWithinDirectory(root, target));
+    const packageDirectory = existsSync(path.join(target, "package.json"));
+    if (!owned && !packageDirectory) {
+      return "package-manager commands must run inside an assignment-owned path or a directory containing package.json (use cd or --prefix)";
+    }
+  }
+  return undefined;
+}
+
+function shellPolicy(
+  command: string,
+  input: RoleRunInput,
+): string | undefined {
+  const pathViolation = shellPathViolation(command, input.cwd);
+  if (pathViolation) return pathViolation;
+  const packageViolation = packageManagerScopeViolation(command, input);
+  if (packageViolation) return packageViolation;
   const alwaysBlocked =
-    /\bgit\s+(?:push|rebase|reset\s+--hard|clean\s+-[^\s]*[fdx]|worktree\s+remove)\b|(?:^|[;&|]\s*)(?:rm|del|erase|rmdir|remove-item)\b|(?:^|[;&|]\s*)(?:npm|pnpm|yarn|bun)\s+(?:publish|login)\b|(?:^|[;&|]\s*)(?:ssh|scp)\b/i;
+    /\bgit\s+(?:push|rebase|reset\s+--hard|clean\s+-[^\s]*[fdx]|worktree\s+remove)\b|(?:^|[;&|]\s*)(?:rm|del|erase|rmdir|remove-item)\b|(?:^|[;&|]\s*)(?:npm|npx|pnpm|yarn|bun|bunx)\s+(?:publish|login)\b|(?:^|[;&|]\s*)(?:ssh|scp)\b/i;
   if (alwaysBlocked.test(command)) return "destructive, publishing, and credential commands are blocked";
   if (
     /(?:^|[;&|]\s*)(?:curl|wget|iwr|invoke-webrequest|nc|ncat|telnet)\b|(?:^|[;&|]\s*)(?:env|printenv)\b|(?:cat|type|get-content)\s+[^;&|]*(?:\.env|\.pem|\.key|\.p12|\.pfx)/i.test(
@@ -279,17 +399,18 @@ function shellPolicy(command: string, writes: boolean): string | undefined {
     return "network access and secret inspection are blocked inside Agent shell tools";
   }
   const directWrite =
-    /(?:^|[^<])(?:>>?|2>|&>)\s*[^&]|(?:^|[;&|]\s*)(?:touch|cp|mv|mkdir|new-item|set-content|add-content)\b/i;
+    /(?:^|[^<=>])(?:>>?|2>|&>)(?![=&])\s*[^&]|(?:^|[;&|]\s*)(?:touch|cp|mv|mkdir|copy|xcopy|robocopy|move|ren|rename|new-item|set-content|add-content)\b/i;
   if (directWrite.test(command)) {
     return "direct shell file writes are blocked; use the scoped write/edit tools";
   }
   if (
-    !writes &&
     /\bgit\s+(?:add|commit|checkout|switch|merge|cherry-pick|rebase|reset|clean|worktree|branch|tag|stash|apply|am)\b/i.test(
       command,
     )
   ) {
-    return "this role is read-only";
+    return input.role.writes
+      ? "VEX owns Git mutations and checkpoints; use write/edit, then team_yield"
+      : "this role is read-only";
   }
   return undefined;
 }
@@ -397,16 +518,23 @@ export class NativeAgentToolExecutor {
     }
     if (name === "bash") {
       const command = text(args.command, "command");
-      const violation = shellPolicy(command, input.role.writes);
+      const violation = shellPolicy(command, input);
       if (violation) throw new Error(violation);
+      const timeoutSignal = AbortSignal.timeout(input.provider.timeoutMs);
+      const commandSignal = signal
+        ? AbortSignal.any([signal, timeoutSignal])
+        : timeoutSignal;
       const result = await this.#shell.run(
         command,
         input.cwd,
-        signal,
+        commandSignal,
         sanitizedEnvironment(),
       );
+      const timeoutMessage = timeoutSignal.aborted && !signal?.aborted
+        ? `\nstderr:\ncommand exceeded ${input.provider.timeoutMs}ms and its process tree was terminated`
+        : "";
       return truncate(
-        `exit=${result.exitCode}\n${result.stdout}${result.stderr ? `\nstderr:\n${result.stderr}` : ""}`,
+        `exit=${result.exitCode}\n${result.stdout}${result.stderr ? `\nstderr:\n${result.stderr}` : ""}${timeoutMessage}`,
       );
     }
     if (name === "write") {
@@ -432,6 +560,12 @@ export class NativeAgentToolExecutor {
         : content.replace(oldText, newText);
       await writeFile(target, updated, "utf8");
       return `edited ${relativeTo(input.cwd, target)}`;
+    }
+    if (name === "delete") {
+      const target = safeTarget(input.cwd, text(args.path, "path"));
+      assertWritable(input, target);
+      await unlink(target);
+      return `deleted ${relativeTo(input.cwd, target)}`;
     }
     throw new Error(`Tool ${name} must be handled by the native agent runner`);
   }

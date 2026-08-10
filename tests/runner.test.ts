@@ -114,22 +114,58 @@ describe("native agent runner", () => {
                 },
               },
             ],
+            usage: {
+              prompt_tokens: 40,
+              completion_tokens: 10,
+              total_tokens: 50,
+              prompt_tokens_details: { cached_tokens: 12 },
+            },
           }),
           { status: 200, headers: { "content-type": "application/json" } },
         );
       },
     });
-    const result = await runner.run(input(runDirectory));
+    const runInput = input(runDirectory);
+    runInput.context.repositoryRoot = "source-root-must-stay-internal";
+    runInput.context.manifest = {
+      repoRoot: "nested-source-root-must-stay-internal",
+      allowedPaths: ["src/**"],
+    };
+    const result = await runner.run(runInput);
     expect(result.exitCode).toBe(0);
     expect(result.yield.summary).toBe("mapped natively");
+    expect(result.usage).toEqual({
+      provider: "fixture",
+      model: "fixture/model",
+      requests: 1,
+      reportedRequests: 1,
+      inputTokens: 40,
+      outputTokens: 10,
+      cachedInputTokens: 12,
+      reasoningTokens: 0,
+      totalTokens: 50,
+    });
     expect(request?.model).toBe("fixture/model");
     expect(authorizations.at(-1)).toBe("Bearer saved-secret");
     expect(JSON.stringify(request)).toContain("team_yield");
+    expect(JSON.stringify(request)).not.toContain("source-root-must-stay-internal");
+    expect(JSON.stringify(request)).not.toContain(
+      "nested-source-root-must-stay-internal",
+    );
+    expect(JSON.stringify(request)).not.toContain('"runDirectory"');
     const session = await readFile(
       path.join(runDirectory, "sessions", "scout", "history.json"),
       "utf8",
     );
     expect(session).toContain("mapped natively");
+    const prompt = await readFile(
+      path.join(runDirectory, "prompts", "scout.md"),
+      "utf8",
+    );
+    expect(prompt).not.toContain("source-root-must-stay-internal");
+    expect(prompt).not.toContain("nested-source-root-must-stay-internal");
+    expect(prompt).toContain("is the repository root");
+    expect(prompt).toContain('"allowedPaths"');
   });
 
   test("executes native tools and feeds literal results back to the model", async () => {
@@ -166,7 +202,14 @@ describe("native agent runner", () => {
               },
             };
         return new Response(
-          JSON.stringify({ choices: [{ message: { content: "", tool_calls: [tool] } }] }),
+          JSON.stringify({
+            choices: [{ message: { content: "", tool_calls: [tool] } }],
+            usage: {
+              prompt_tokens: 10,
+              completion_tokens: 5,
+              total_tokens: 15,
+            },
+          }),
           { status: 200, headers: { "content-type": "application/json" } },
         );
       },
@@ -176,5 +219,12 @@ describe("native agent runner", () => {
     expect(call).toBe(2);
     expect(secondRequest).toContain("native evidence");
     expect(result.rawOutput).toContain('"name":"read"');
+    expect(result.usage).toMatchObject({
+      requests: 2,
+      reportedRequests: 2,
+      inputTokens: 20,
+      outputTokens: 10,
+      totalTokens: 30,
+    });
   });
 });

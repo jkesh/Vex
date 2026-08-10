@@ -14,10 +14,29 @@ import {
 import {
   filterSelectItems,
   parseSgrMouseEvents,
+  PromptHistory,
   renderHome,
 } from "../src/cli-ui.js";
 
 describe("standalone CLI argument parser", () => {
+  test("recalls prompt history with draft restoration and bounded deduplication", () => {
+    const history = new PromptHistory(3);
+    history.push("/providers");
+    history.push("/providers");
+    history.push("review this repository");
+    history.push("/routing");
+    history.begin("draft");
+
+    expect(history.previous("draft")).toBe("/routing");
+    expect(history.previous("/routing")).toBe("review this repository");
+    expect(history.previous("review this repository")).toBe("/providers");
+    expect(history.previous("/providers")).toBeUndefined();
+    expect(history.next()).toBe("review this repository");
+    expect(history.next()).toBe("/routing");
+    expect(history.next()).toBe("draft");
+    expect(history.next()).toBeUndefined();
+  });
+
   test("opens the workspace without arguments", () => {
     expect(parseCliArguments([]).command).toBe("interactive");
     expect(parseCliArguments(["connect", "openai"])).toMatchObject({
@@ -71,6 +90,10 @@ describe("standalone CLI argument parser", () => {
       command: "assess",
       values: ["the", "architecture"],
     });
+    expect(parseCliArguments(["code-review", "src"])).toMatchObject({
+      command: "code-review",
+      values: ["src"],
+    });
   });
 
   test("preserves natural-language input for mode routing", () => {
@@ -105,9 +128,17 @@ describe("standalone CLI argument parser", () => {
       kind: "invoke",
       invocation: { command: "assess", values: ["architecture risks"] },
     });
+    expect(parseInteractiveInput("/code-review authentication")).toMatchObject({
+      kind: "invoke",
+      invocation: { command: "code-review", values: ["authentication"] },
+    });
     expect(parseInteractiveInput("/status run-1")).toMatchObject({
       kind: "invoke",
       invocation: { command: "status", values: ["run-1"] },
+    });
+    expect(parseInteractiveInput("/usage run-1")).toMatchObject({
+      kind: "invoke",
+      invocation: { command: "usage", values: ["run-1"] },
     });
     expect(parseInteractiveInput("/login openai")).toEqual({
       kind: "unknown",
@@ -193,7 +224,9 @@ describe("standalone CLI argument parser", () => {
       "/model ",
       "/models ",
     ]);
+    expect(complete("/us")[0]).toEqual(["/usage "]);
     expect(complete("/mode r")[0]).toEqual(["/mode review"]);
+    expect(complete("/mode code")[0]).toEqual(["/mode code-review"]);
     expect(complete("/provider an")[0]).toEqual(["/provider anthropic "]);
     expect(complete("/provider openai o")[0]).toEqual([
       "/provider openai oauth",
@@ -204,6 +237,9 @@ describe("standalone CLI argument parser", () => {
       "assign models to targets repeatedly; Esc finishes",
     );
     expect(interactiveHelp()).not.toContain("/login");
+    expect(interactiveHelp()).toContain(
+      "/usage [run-id]    show Token use by Agent, Provider, and model",
+    );
     expect(complete("/model cla")[0]).toEqual(["/model claude-sonnet"]);
     expect(complete("/route architect anth")[0]).toEqual([
       "/route architect anthropic ",
@@ -227,13 +263,13 @@ describe("standalone CLI argument parser", () => {
       "/mode",
       "/route",
       "/chat",
+      "/code-review",
       "/assess",
       "/run",
-      "/help",
     ]);
     expect(hints("/mode")[0]).toEqual({
       value: "/mode ",
-      description: "select auto, chat, review, or implement",
+      description: "select auto, chat, review, code-review, or implement",
     });
     expect(hints("/provider an")[0]).toEqual({
       value: "/provider anthropic ",
@@ -246,6 +282,10 @@ describe("standalone CLI argument parser", () => {
     expect(hints("/mode r")[0]).toEqual({
       value: "/mode review",
       description: "read-only Scout and Technical Reviewer",
+    });
+    expect(hints("/mode code")[0]).toEqual({
+      value: "/mode code-review",
+      description: "read-only Reviewer only; no Scout or writers",
     });
     expect(hints("/route arch")[0]).toEqual({
       value: "/route architect ",
@@ -266,11 +306,12 @@ describe("standalone CLI argument parser", () => {
       head: "",
       dirty: false,
     });
-    expect(home).toContain("auto selects chat, review, or implement");
-    expect(home).toContain("/mode auto|chat|review|implement");
+    expect(home).toContain("auto selects chat, review, code-review, or implement");
+    expect(home).toContain("/mode auto|chat|review|code-review|implement");
     expect(home).toContain("/provider");
-    expect(home).toContain("Type / for live hints");
+    expect(home).toContain("Type / for hints");
     expect(interactiveHelp()).toContain("Use Up/Down to choose and Tab to complete");
+    expect(interactiveHelp()).toContain("Up recalls history");
     expect(home).toContain("two-pane model selector");
     expect(home).toContain("/route (per-role routing)");
     expect(home).not.toContain("1  Run a task");

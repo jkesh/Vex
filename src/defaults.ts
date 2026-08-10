@@ -1,0 +1,2 @@
+export const DEFAULT_MAX_REPAIR_ATTEMPTS = 4;
+export const MAX_TRANSIENT_ROLE_RETRIES = 2;

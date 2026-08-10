@@ -90,41 +90,43 @@ export class FileOwnershipPolicy {
         });
       }
 
-      if (
-        role === "backend" &&
-        FRONTEND_PATH.test(file) &&
-        !TEST_PATH.test(file)
-      ) {
-        violations.push({
-          role,
-          path: file,
-          rule: "role-boundary",
-          message: "backend changed a frontend-owned path",
-        });
-      }
-      if (
-        role === "frontend" &&
-        BACKEND_PATH.test(file) &&
-        !TEST_PATH.test(file)
-      ) {
-        violations.push({
-          role,
-          path: file,
-          rule: "role-boundary",
-          message: "frontend changed a backend-owned path",
-        });
-      }
-      if (
-        role === "test-engineer" &&
-        !TEST_PATH.test(file) &&
-        !/^(?:README|docs\/)/i.test(file)
-      ) {
-        violations.push({
-          role,
-          path: file,
-          rule: "role-boundary",
-          message: "test-engineer changed a non-test path",
-        });
+      if (!allowedPaths) {
+        if (
+          role === "backend" &&
+          FRONTEND_PATH.test(file) &&
+          !TEST_PATH.test(file)
+        ) {
+          violations.push({
+            role,
+            path: file,
+            rule: "role-boundary",
+            message: "backend changed a frontend-owned path",
+          });
+        }
+        if (
+          role === "frontend" &&
+          BACKEND_PATH.test(file) &&
+          !TEST_PATH.test(file)
+        ) {
+          violations.push({
+            role,
+            path: file,
+            rule: "role-boundary",
+            message: "frontend changed a backend-owned path",
+          });
+        }
+        if (
+          role === "test-engineer" &&
+          !TEST_PATH.test(file) &&
+          !/^(?:README|docs\/)/i.test(file)
+        ) {
+          violations.push({
+            role,
+            path: file,
+            rule: "role-boundary",
+            message: "test-engineer changed a non-test path",
+          });
+        }
       }
 
       const owner = existing.get(file);

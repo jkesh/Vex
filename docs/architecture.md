@@ -15,7 +15,7 @@ VEX does not load another coding-agent runtime, extension host, orchestration pl
 
 ## CLI information architecture
 
-The no-argument entrypoint is a direct natural-language session. It presents workspace identity, isolation mode, the latest implementation run, and a single prompt. Plain text is classified as chat, read-only technical review, or implementation. Slash commands provide an explicit mode override, Provider login/selection, per-role model routing, plan, status, diff, recovery, review, merge, configuration, clear, and quit controls. Typing `/` opens a live filtered hint panel with command descriptions; Up/Down moves its active suggestion and Tab completes it. The same panel supplies known Provider, authentication method, mode, role, and discovered-model arguments. There is no numbered action menu.
+The no-argument entrypoint is a direct natural-language session. It presents workspace identity, isolation mode, the latest implementation run, and a single prompt. Plain text is classified as chat, read-only technical review, reviewer-only code review, or implementation. Slash commands provide an explicit mode override, Provider login/selection, per-role model routing, plan, status, diff, recovery, review, merge, configuration, clear, and quit controls. At a normal prompt, Up/Down (or Ctrl+P/Ctrl+N) navigates bounded in-process prompt history and restores the unfinished draft. Typing `/` opens a live filtered hint panel with command descriptions; Up/Down then moves its active suggestion and Tab completes it. The same panel supplies known Provider, authentication method, mode, role, and discovered-model arguments. There is no numbered action menu.
 
 Connection and routing commands use VEX-owned selectors. `/provider` is the single interactive Provider command and resolves four access states: saved OAuth session, saved API key, environment credential, or keyless local endpoint. OpenAI adds a VEX-owned method picker. The recommended method starts ChatGPT OAuth with PKCE and a random state, opens the authorization URL with the operating system's HTTPS handler, and accepts only the loopback callback at `http://localhost:1455/auth/callback`; direct API-key entry remains available. `/model` concurrently fetches every accessible live catalog and opens a full-screen two-pane selector with Providers on the left and the active Provider's models on the right. It supports SGR mouse clicks and wheel scrolling as well as keyboard navigation and type-to-filter. An argument seeds the search rather than bypassing it. After model selection, a second picker assigns the model to the session default or one fixed Agent role. Each assignment is applied immediately, marked in the role picker, and returns to the same model catalog so more roles can be configured without another network fetch; Esc completes the routing session. Provider profiles separate generation `protocol` from `modelCatalog`: OpenAI-compatible catalogs follow `GET <baseUrl>/models` with `data[].id`, while Anthropic catalogs use the same resource with cursor pagination and native authentication. This permits a gateway to expose native Messages and an OpenAI-compatible catalog independently. Bare `/route` follows the same repeated model-first flow and then requires a role; explicit `/route <role> <provider> <model>` and process options remain available for automation without depending on another CLI.
 
@@ -30,13 +30,15 @@ flowchart LR
   P["Natural-language prompt"] --> M["VEX semantic mode router"]
   M -->|"conversation / explanation"| C["Chat\nno workspace tools"]
   M -->|"inspect / assess / no changes"| R["Review\nread-only Scout + Reviewer"]
+  M -->|"explicit code review"| CR["Code review\nread-only Reviewer only"]
   M -->|"implement / fix / refactor"| I["Implement\nfull isolated multi-agent workflow"]
   C --> O["Direct response"]
   R --> F["Evidence-backed findings artifact"]
+  CR --> F
   I --> G["Plan → approval → writers → review → merge gate"]
 ```
 
-`auto` first applies deterministic multilingual safety rules. Explicit no-change and review-only language always routes to review; explicit mutation language routes to implementation; clear conversation routes to chat. Only low-confidence prompts are sent to the configured model for structured semantic classification. If that classifier cannot run, the fallback is chat, the least-capable and non-mutating mode. Short continuation prompts inherit the last resolved mode. `/mode auto|chat|review|implement` overrides the router, while `/chat`, `/assess`, and `/run` select a mode for one turn.
+`auto` first applies deterministic multilingual safety rules. Explicit code-review language without a mutation request routes to `code-review`; broad no-change and assessment language routes to `review`; explicit mutation language routes to implementation; clear conversation routes to chat. Only low-confidence prompts are sent to the configured model for structured semantic classification. If that classifier cannot run, the fallback is chat, the least-capable and non-mutating mode. Short continuation prompts inherit the last resolved mode. `/mode auto|chat|review|code-review|implement` overrides the router, while `/chat`, `/assess`, `/code-review`, and `/run` select a mode for one turn.
 
 Capabilities are assigned after classification rather than hidden behind prompts:
 
@@ -44,17 +46,18 @@ Capabilities are assigned after classification rather than hidden behind prompts
 | --- | --- | --- | --- |
 | Chat | none | none | in-memory conversation for the current process |
 | Review | `read`, `ls`, `find`, `grep` | none | `~/.vex/reviews/<workspace-id>/<review-id>/technical-review.json` |
-| Implement | fixed role-specific tools | manifest-scoped writer worktrees only | schema-5 run state, commits, findings, and integration diff |
+| Code review | `read`, `ls`, `find`, `grep` | none | `~/.vex/reviews/<workspace-id>/<review-id>/code-review.json` |
+| Implement | fixed role-specific tools | manifest-scoped writer worktrees only | schema-7 run state, commits, findings, usage, and integration diff |
 
-Technical review uses the existing fixed Scout and Reviewer identities with a stricter mode-specific tool projection. It does not expose shell, write, edit, Git mutation, worktree, repair, or merge capabilities and works in both Git and ordinary directories. Chat uses a separate no-tool provider session and is never given repository content implicitly.
+Technical review uses the existing fixed Scout and Reviewer identities with a stricter mode-specific tool projection. Code review skips Scout and invokes only the fixed Reviewer, which inspects the repository directly. Neither path exposes shell, write, edit, Git mutation, worktree, repair, delegation, or merge capabilities, and both work in Git and ordinary directories. Chat uses a separate no-tool provider session and is never given repository content implicitly.
 
-Mode execution reuses VEX's named Provider routing without coupling the modes together. Chat and low-confidence classification use the Architect route; technical review uses the independently configured Scout and Reviewer routes; implementation uses the complete fixed-role map. Session `/route` overrides therefore apply consistently across all three modes.
+Mode execution reuses VEX's named Provider routing without coupling the modes together. Chat and low-confidence classification use the Architect route; technical review uses the independently configured Scout and Reviewer routes; code review uses only Reviewer; implementation uses the complete fixed-role map. Session `/route` overrides therefore apply consistently across all modes.
 
 Planning and execution switch to a dashboard organized by operational questions:
 
 1. What run and goal is active?
 2. Which immutable base and integration ref are in use?
-3. Which role is pending, running, complete, skipped, or failed?
+3. Which Agent is not started, waiting (and for what), working, delivered, skipped, blocked, or failed?
 4. What changed most recently?
 5. How many commits, change results, and findings exist?
 6. Is the integration ready for inspection and explicit merge?
@@ -70,11 +73,11 @@ Each role has a VEX-owned history at `sessions/<role>/history.json`. Review repa
 Native tools are:
 
 - `read`, `ls`, `find`, and `grep` for repository evidence;
-- `bash` for bounded checks and Git commits;
-- `write` and `edit` for assignment-scoped changes;
+- `bash` for bounded foreground checks;
+- `write`, `edit`, and single-file `delete` for assignment-scoped changes;
 - `team_yield` for the only structural completion path.
 
-Path resolution rejects worktree escapes. Secret files are excluded from read/search and credential-like environment variables are removed from Agent shell processes. Read-only roles cannot edit and may not run mutating Git or shell-write commands. Writers may use `write` and `edit` only within manifest `allowedPaths`. All roles are blocked from direct network clients, destructive Git/filesystem operations, publishing, and credential-bound commands. The orchestrator additionally verifies HEAD, dirty status, commits, changed files, ownership, integration state, and command cleanliness from Git rather than trusting model output.
+Path resolution rejects worktree escapes. Internal source-workspace and run-artifact paths are removed from Agent-visible context; shell commands reject absolute targets and traversal outside the assigned worktree before execution. Secret files are excluded from read/search and credential-like environment variables are removed from Agent shell processes. Read-only roles cannot edit and may not run mutating Git or shell-write commands. Writers may use `write` and `edit` only within manifest `allowedPaths`. All roles are blocked from direct network clients, destructive Git/filesystem operations, publishing, and credential-bound commands. The orchestrator additionally verifies HEAD, dirty status, commits, changed files, ownership, integration state, and command cleanliness from Git rather than trusting model output.
 
 ## Fixed roles and immutable manifest
 
@@ -82,9 +85,29 @@ Role definitions in `roles/*.md` are loaded and SHA-256 hashed. Exactly Scout, A
 
 The Architect can create assignments only for the three writers. VEX binds those assignments into an `ExecutionManifest` with run, repository, base commit, goal, constraints, contracts, dependency graph, allowed paths, expected results, integration order, trusted project commands, risks, security decision, and role hashes.
 
-Unknown/duplicate roles, cycles, path traversal, `.git` ownership, invalid dependencies, and overlapping write ownership fail before confirmation. Repository `.vex` configuration is ignored unless the CLI receives `--trust-project`.
+Unknown/duplicate roles, cycles, path traversal, `.git` ownership, invalid dependencies, and overlapping write ownership fail before confirmation. A structurally invalid Architect result is not silently weakened: VEX records `manifest-rejected`, returns the exact error to the same Architect session, and permits only the configured bounded correction attempts. Repository `.vex` configuration is ignored unless the CLI receives `--trust-project`.
 
 ## State machine
+
+Each Agent has its own persisted lifecycle inside the run state:
+
+```mermaid
+stateDiagram-v2
+  [*] --> NotStarted
+  NotStarted --> Waiting: dependency / approval / scheduled turn
+  NotStarted --> Working: immediately runnable
+  Waiting --> Working: gate satisfied
+  Working --> Delivered: accepted team_yield
+  Delivered --> Waiting: routed review finding
+  Waiting --> Working: synchronized repair turn
+  Working --> Failed
+  Waiting --> Blocked: run stops before the gate clears
+  Working --> Aborted
+```
+
+The persisted values are `pending`, `waiting`, `running`, and `completed`, displayed as `not-started`, `waiting`, `working`, and `delivered`. Waiting states require a non-empty `waitingFor`; every transition updates `statusChangedAt` and emits an event. `skipped`, `blocked`, `failed`, and `aborted` represent exceptional terminal outcomes. A recognized transient Provider interruption may enter a bounded `working → waiting → working` retry only when Git proves that HEAD is unchanged and the worktree is clean; dirty, committed, cancelled, blocked, policy, and deterministic failures are never automatically replayed. Repair worktrees are reset to the latest clean integration HEAD before an owner starts, preventing downstream repairs and tests from observing stale sibling changes.
+
+The run-level state machine coordinates those Agent lifecycles. Implementation review defaults to four bounded owner-routed repair attempts (configurable from zero through five), while transient Provider retries remain independently capped at two:
 
 ```mermaid
 stateDiagram-v2
@@ -118,6 +141,7 @@ Git repositories keep the authoritative run record in the Git common directory:
   scout-report.json
   role-definition-hashes.json
   events.json
+  usage.json
   command-results.json
   review-cycles.json
   findings.json
@@ -130,7 +154,11 @@ Git repositories keep the authoritative run record in the Git common directory:
 
 Ordinary directories store state under `<workspace>/.vex/runs/`. Their persistent managed snapshot repositories live under `~/.vex/workspaces/` and are removed after a successful merge or cleanup. No `.git` entry is created in the source directory.
 
-State and JSON artifacts use atomic replacement. Schema 5 records workspace mode and managed execution root, configuration source names, named Provider metadata without secrets, per-role Provider/model routes, role attempts, worktrees, changes, commands, review cycles, findings, events, integration/final refs, and active process identity. Older states are migrated for status and cleanup but cannot bypass current role-hash or merge validation.
+Before VEX checkpoints a successful writer yield, it recursively prunes known dependency and cache directories only when `git ls-files` proves that the directory contains no tracked files; the traversal is confined to the isolated worktree and does not follow symlinks. State and JSON artifacts use atomic replacement, with bounded backoff for transient Windows `EPERM`, `EACCES`, and `EBUSY` rename contention; the last complete state remains readable until replacement succeeds.
+
+Schema 7 records workspace mode and managed execution root, configuration source names, named Provider metadata without secrets, per-role Provider/model routes, Agent lifecycle status/reason/timestamps/attempts, worktrees, changes, commands, review cycles, findings, events, integration/final refs, active process identity, and Token usage. Usage stores request count plus Provider-reported input, output, cached-input, reasoning, and total Tokens. Agent records are authoritative; run, Provider, and Provider/model totals are rebuilt from them while loading, so stale derived totals cannot corrupt reporting. `reportedRequests` may be lower than `requests` when a failed response or compatible gateway omits usage; VEX preserves that distinction rather than presenting unknown Tokens as measured zero. `/usage` and `vex usage` expose the aggregate, while each role result stores its own attempt usage. Schema 5 and 6 states migrate to schema 7 with normalized lifecycle data and zero usage, but no legacy state can bypass current role-hash or merge validation.
+
+Read-only technical review artifacts live under `~/.vex/reviews/<workspace-id>/<review-id>/`. Their `usage.json` aggregates Scout and Reviewer; reviewer-only code review records only Reviewer. Chat and semantic-classifier requests remain process-local conversations and are not part of implementation-run usage.
 
 ## Extension points
 

@@ -17,6 +17,7 @@ import {
   type RoleRuntimeConfig,
   type ThinkingLevel,
 } from "./types.js";
+import { DEFAULT_MAX_REPAIR_ATTEMPTS } from "./defaults.js";
 
 const THINKING_LEVELS = [
   "off",
@@ -461,7 +462,7 @@ export const BUILTIN_PROVIDER_PROFILES: Record<
     headersEnv: {},
     sendReasoningEffort: false,
     timeoutMs: 120_000,
-    maxAgentTurns: 40,
+    maxAgentTurns: 60,
   },
   openrouter: {
     id: "openrouter",
@@ -473,7 +474,7 @@ export const BUILTIN_PROVIDER_PROFILES: Record<
     headersEnv: {},
     sendReasoningEffort: false,
     timeoutMs: 120_000,
-    maxAgentTurns: 40,
+    maxAgentTurns: 60,
   },
   anthropic: {
     id: "anthropic",
@@ -485,7 +486,7 @@ export const BUILTIN_PROVIDER_PROFILES: Record<
     headersEnv: {},
     sendReasoningEffort: false,
     timeoutMs: 120_000,
-    maxAgentTurns: 40,
+    maxAgentTurns: 60,
   },
   deepseek: {
     id: "deepseek",
@@ -497,7 +498,7 @@ export const BUILTIN_PROVIDER_PROFILES: Record<
     headersEnv: {},
     sendReasoningEffort: false,
     timeoutMs: 120_000,
-    maxAgentTurns: 40,
+    maxAgentTurns: 60,
   },
   ollama: {
     id: "ollama",
@@ -508,7 +509,7 @@ export const BUILTIN_PROVIDER_PROFILES: Record<
     headersEnv: {},
     sendReasoningEffort: false,
     timeoutMs: 120_000,
-    maxAgentTurns: 40,
+    maxAgentTurns: 60,
   },
 };
 
@@ -580,7 +581,7 @@ function resolveProviderProfiles(
       sendReasoningEffort:
         raw.sendReasoningEffort ?? builtin?.sendReasoningEffort ?? false,
       timeoutMs: raw.timeoutMs ?? builtin?.timeoutMs ?? 120_000,
-      maxAgentTurns: raw.maxAgentTurns ?? builtin?.maxAgentTurns ?? 40,
+      maxAgentTurns: raw.maxAgentTurns ?? builtin?.maxAgentTurns ?? 60,
     };
   }
   const selected = providers[defaultProvider];
@@ -616,7 +617,7 @@ export class VexConfigLoader {
     const config = mergeConfig(
       {
         maxParallelWriters: 2,
-        maxRepairAttempts: 2,
+        maxRepairAttempts: DEFAULT_MAX_REPAIR_ATTEMPTS,
       },
       loaded.config,
     );
@@ -675,7 +676,8 @@ export class VexConfigLoader {
     if (overrides.provider || overrides.roleRoutes) sources.push("session:routing");
     return {
       maxParallelWriters: (config.maxParallelWriters ?? 2) as 1 | 2,
-      maxRepairAttempts: config.maxRepairAttempts ?? 2,
+      maxRepairAttempts:
+        config.maxRepairAttempts ?? DEFAULT_MAX_REPAIR_ATTEMPTS,
       projectCommands: config.projectCommands ?? [],
       defaultProvider: profiles.defaultProvider,
       provider: profiles.providers[profiles.defaultProvider]!,
