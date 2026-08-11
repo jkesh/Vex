@@ -331,9 +331,6 @@ export function parseInteractiveInput(input: string): InteractiveInput {
   }
   if (command === "/config") return interactiveInvocation("config");
   if (command === "/providers") return interactiveInvocation("providers");
-  if (command === "/models") {
-    return interactiveInvocation("models", argument ? [argument.toLowerCase()] : []);
-  }
   if (command === "/logout") {
     return interactiveInvocation(
       "logout",
@@ -371,11 +368,11 @@ Type / for live command hints. Use Up/Down to choose and Tab to complete command
   /cleanup [run-id]  remove retained worktrees
   /config            show provider and role routing
   /providers         list Provider profiles and login status
-  /models [provider] open the two-pane Provider/model selector
   /provider [id] [oauth|api-key|setup]
                      connect a Provider; add/configure NewAPI or Sub2API
   /logout [provider] select and remove a saved login
-  /model [query]     assign models to targets repeatedly; Esc finishes
+  /model [provider|query]
+                     choose models and assign targets; Esc finishes
   /route [role] [provider] [model]
                      repeatedly choose model then role, or set one explicitly
   /routing           show saved user model routing and session mode
@@ -404,7 +401,6 @@ const INTERACTIVE_COMMAND_COMPLETIONS = [
   "/cleanup ",
   "/config",
   "/providers",
-  "/models ",
   "/logout ",
   "/provider ",
   "/model ",
@@ -428,7 +424,6 @@ const INTERACTIVE_COMMAND_DESCRIPTIONS: Record<string, string> = {
   "/plan": "create a plan without starting writers",
   "/security": "run implementation with Security Reviewer enabled",
   "/providers": "list Provider profiles and authentication status",
-  "/models": "open the Provider/model selector",
   "/routing": "show saved user model routing and session mode",
   "/logout": "remove a saved Provider login",
   "/config": "show resolved Provider and role configuration",
@@ -457,7 +452,6 @@ const INTERACTIVE_HINT_PRIORITY = [
   "/run",
   "/help",
   "/providers",
-  "/models",
   "/routing",
   "/plan",
   "/security",
@@ -480,6 +474,18 @@ const INTERACTIVE_HINT_PRIORITY = [
 export interface InteractiveCompletionContext {
   providers: string[];
   models: Array<{ provider: string; model: string }>;
+}
+
+export function modelSelectionFilter(
+  value: string,
+  providers: readonly string[],
+): { requestedProvider?: string; initialQuery?: string } {
+  const query = value.trim();
+  if (!query) return {};
+  const normalized = query.toLowerCase();
+  return providers.some((provider) => provider.toLowerCase() === normalized)
+    ? { requestedProvider: normalized }
+    : { initialQuery: query };
 }
 
 function completionMatches(line: string, candidates: readonly string[]): string[] {
@@ -507,7 +513,7 @@ export function createInteractiveCompleter(
     let candidates: string[] = [];
     if (command === "/mode") {
       candidates = VEX_WORK_MODES.map((mode) => `/mode ${mode}`);
-    } else if (command === "/models" || command === "/logout") {
+    } else if (command === "/logout") {
       candidates = context.providers.map((provider) => `${command} ${provider}`);
     } else if (command === "/provider") {
       if (parts.length === 0 || (parts.length === 1 && !endsWithSpace)) {
@@ -588,7 +594,7 @@ function describeInteractiveHint(
       ? "browser authorization; no API key required"
       : "save an API key in the VEX auth store";
   }
-  if (command === "/models" || command === "/logout") {
+  if (command === "/logout") {
     const provider = arguments_[0]!;
     return `${PROVIDER_NAMES[provider] ?? provider} Provider`;
   }
@@ -1871,7 +1877,10 @@ async function interactive(runtime: Runtime, cwd: string): Promise<void> {
         const updates = await configureModelRoutes(runtime, cwd, routing, {
           ...(routing.provider ? { initialProvider: routing.provider } : {}),
           ...(routing.model ? { initialModel: routing.model } : {}),
-          ...(action.model ? { initialQuery: action.model } : {}),
+          ...modelSelectionFilter(
+            action.model,
+            completionContext.providers,
+          ),
           targetMode: "session-or-role",
           onCatalogs: rememberCatalogs,
         });
@@ -1950,19 +1959,6 @@ async function interactive(runtime: Runtime, cwd: string): Promise<void> {
     try {
       if (action.invocation.command === "logout") {
         await logoutFromProvider(runtime, cwd, action.invocation.values[0]);
-        continue;
-      }
-      if (action.invocation.command === "models") {
-        const updates = await configureModelRoutes(runtime, cwd, routing, {
-          ...(action.invocation.values[0]
-            ? { requestedProvider: action.invocation.values[0] }
-            : {}),
-          ...(routing.provider ? { initialProvider: routing.provider } : {}),
-          ...(routing.model ? { initialModel: routing.model } : {}),
-          targetMode: "session-or-role",
-          onCatalogs: rememberCatalogs,
-        });
-        writeModelRouteUpdates(updates);
         continue;
       }
       await execute(

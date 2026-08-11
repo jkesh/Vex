@@ -9,6 +9,7 @@ import {
   customProviderProfile,
   interactiveHelp,
   isDirectExecution,
+  modelSelectionFilter,
   modelTargetItems,
   parseCliArguments,
   parseInteractiveInput,
@@ -153,9 +154,9 @@ describe("standalone CLI argument parser", () => {
       kind: "unknown",
       command: "/connect",
     });
-    expect(parseInteractiveInput("/models openrouter")).toMatchObject({
-      kind: "invoke",
-      invocation: { command: "models", values: ["openrouter"] },
+    expect(parseInteractiveInput("/models openrouter")).toEqual({
+      kind: "unknown",
+      command: "/models",
     });
     expect(parseInteractiveInput("/provider openrouter")).toEqual({
       kind: "set-provider",
@@ -232,7 +233,6 @@ describe("standalone CLI argument parser", () => {
     expect(complete("/mo")[0]).toEqual([
       "/mode ",
       "/model ",
-      "/models ",
     ]);
     expect(complete("/us")[0]).toEqual(["/usage "]);
     expect(complete("/mode r")[0]).toEqual(["/mode review"]);
@@ -252,8 +252,9 @@ describe("standalone CLI argument parser", () => {
       "/provider [id] [oauth|api-key|setup]",
     );
     expect(interactiveHelp()).toContain(
-      "assign models to targets repeatedly; Esc finishes",
+      "choose models and assign targets; Esc finishes",
     );
+    expect(interactiveHelp()).not.toContain("/models");
     expect(interactiveHelp()).not.toContain("/login");
     expect(interactiveHelp()).toContain(
       "/usage [run-id]    show Token use by Agent, Provider, and model",
@@ -416,6 +417,17 @@ describe("standalone CLI argument parser", () => {
         baseUrl: "https://sub.example/v1",
         requiresAuth: true,
       });
+  });
+
+  test("uses the single model command for Provider and model filtering", () => {
+    const providers = ["openai", "deepseek"];
+    expect(modelSelectionFilter("DeepSeek", providers)).toEqual({
+      requestedProvider: "deepseek",
+    });
+    expect(modelSelectionFilter("deepseek-v4", providers)).toEqual({
+      initialQuery: "deepseek-v4",
+    });
+    expect(modelSelectionFilter("", providers)).toEqual({});
   });
 
   test("recognizes execution through an npm-style directory link", async () => {
