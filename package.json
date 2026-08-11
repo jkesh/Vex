@@ -1,6 +1,6 @@
 {
   "name": "vex-agent-cli",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "description": "Independent adaptive chat, code review, and multi-agent engineering CLI",
   "type": "module",
   "license": "Apache-2.0",

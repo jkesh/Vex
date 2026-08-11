@@ -1127,8 +1127,11 @@ interface SelectedModel {
   target?: ModelTarget;
 }
 
-type ModelTarget = "session-default" | ModelRole;
+export type ModelTarget = "session-default" | ModelRole;
 type ModelTargetMode = "session-or-role" | "role-only";
+export type ModelTargetRoutes = Partial<
+  Record<ModelTarget, { provider?: string; model?: string }>
+>;
 
 interface ChooseModelOptions {
   requestedProvider?: string;
@@ -1136,6 +1139,7 @@ interface ChooseModelOptions {
   initialModel?: string;
   initialQuery?: string;
   targetMode?: ModelTargetMode;
+  targetRoutes?: ModelTargetRoutes;
   continueAfterTargetAssignment?: boolean;
   onTargetAssigned?(
     selection: SelectedModel & { target: ModelTarget },
@@ -1143,22 +1147,88 @@ interface ChooseModelOptions {
   onCatalogs?(catalogs: readonly ProviderModelCatalog[]): void;
 }
 
-function modelTargetItems(includeSessionDefault: boolean): SelectItem<ModelTarget>[] {
+function routeConfigured(
+  route: { provider?: string; model?: string } | undefined,
+): boolean {
+  return Boolean(route?.provider || route?.model);
+}
+
+function effectiveTargetRoute(
+  target: ModelTarget,
+  routes: ModelTargetRoutes,
+): { provider?: string; model?: string } | undefined {
+  const direct = routes[target];
+  const defaults = routes["session-default"];
+  if (target === "session-default") return direct;
+  if (!routeConfigured(direct) && !routeConfigured(defaults)) return undefined;
+  const provider = direct?.provider ?? defaults?.provider;
+  const model = direct?.model ?? defaults?.model;
+  return {
+    ...(provider ? { provider } : {}),
+    ...(model ? { model } : {}),
+  };
+}
+
+function routeLabel(route: { provider?: string; model?: string }): string {
+  return `${route.provider ?? "default Provider"}/${route.model ?? "default model"}`;
+}
+
+function assignedModelTargets(
+  routes: ModelTargetRoutes,
+  provider: string,
+  model: string,
+): string[] {
+  return (["session-default", ...MODEL_ROLES] as ModelTarget[]).flatMap(
+    (target) => {
+      if (!routeConfigured(routes[target])) return [];
+      const effective = effectiveTargetRoute(target, routes);
+      return effective?.provider === provider && effective.model === model
+        ? [target === "session-default" ? "default" : target]
+        : [];
+    },
+  );
+}
+
+function assignmentSummary(targets: readonly string[]): string {
+  if (targets.length <= 4) return targets.join(", ");
+  return `${targets.slice(0, 3).join(", ")} +${targets.length - 3}`;
+}
+
+export function modelTargetItems(
+  includeSessionDefault: boolean,
+  routes: ModelTargetRoutes = {},
+): SelectItem<ModelTarget>[] {
+  const defaults: SelectItem<ModelTarget>[] = includeSessionDefault
+    ? [{
+        value: "session-default",
+        label: "Session default",
+        get description() {
+          const route = routes["session-default"];
+          return [
+            routeConfigured(route) ? `current ${routeLabel(route!)}` : "",
+            "used by every role without its own override",
+          ].filter(Boolean).join(" · ");
+        },
+        keywords: ["default", "all", "session"],
+      }]
+    : [];
   return [
-    ...(includeSessionDefault
-      ? [{
-          value: "session-default" as const,
-          label: "Session default",
-          description: "used by every role without its own override",
-          keywords: ["default", "all", "session"],
-        }]
-      : []),
-    ...MODEL_ROLES.map((role): SelectItem<ModelTarget> => ({
-      value: role,
-      label: role,
-      description: ROLE_DESCRIPTIONS[role],
-      keywords: [role, ROLE_DESCRIPTIONS[role]],
-    })),
+    ...defaults,
+    ...MODEL_ROLES.map((role): SelectItem<ModelTarget> => {
+      return {
+        value: role,
+        label: role,
+        get description() {
+          const direct = routes[role];
+          const effective = effectiveTargetRoute(role, routes);
+          const current = effective
+            ? `${routeConfigured(direct) ? "current" : "inherits"} ${routeLabel(effective)}`
+            : "";
+          return [current, ROLE_DESCRIPTIONS[role]].filter(Boolean).join(" · ");
+        },
+        keywords: [role, ROLE_DESCRIPTIONS[role]],
+      };
+    }),
   ];
 }
 
@@ -1210,19 +1280,34 @@ async function chooseModel(
       const catalog = catalogs.get(entry.provider.id);
       const failure = failures.get(entry.provider.id);
       const models: SelectItem<SelectedModel>[] = (catalog?.models ?? []).map(
-        (model) => ({
-          value: { provider: entry.provider.id, model: model.id },
-          label: modelLabel(model),
-          description: modelDescription(model),
-          keywords: [
-            entry.provider.id,
-            model.id,
-            model.displayName ?? "",
-            model.description ?? "",
-            model.ownedBy ?? "",
-            ...(model.capabilities ?? []),
-          ],
-        }),
+        (model) => {
+          const baseDescription = modelDescription(model);
+          return {
+            value: { provider: entry.provider.id, model: model.id },
+            label: modelLabel(model),
+            get description() {
+              const targets = assignedModelTargets(
+                options.targetRoutes ?? {},
+                entry.provider.id,
+                model.id,
+              );
+              return [
+                targets.length > 0
+                  ? `assigned: ${assignmentSummary(targets)}`
+                  : "",
+                baseDescription,
+              ].filter(Boolean).join(" · ");
+            },
+            keywords: [
+              entry.provider.id,
+              model.id,
+              model.displayName ?? "",
+              model.description ?? "",
+              model.ownedBy ?? "",
+              ...(model.capabilities ?? []),
+            ],
+          };
+        },
       );
       const name = PROVIDER_NAMES[entry.provider.id];
       return {
@@ -1295,10 +1380,14 @@ async function chooseModel(
         title: includeSessionDefault
           ? "Choose the model target"
           : "Choose an Agent role",
-        items: modelTargetItems(includeSessionDefault),
+        items: modelTargetItems(includeSessionDefault, options.targetRoutes),
         initialValue: includeSessionDefault
           ? "session-default"
           : MODEL_ROLES[0],
+        assignedValues: Object.entries(options.targetRoutes ?? {}).flatMap(
+          ([target, route]) =>
+            routeConfigured(route) ? [target as ModelTarget] : [],
+        ),
       },
       pickerOptions,
       targetBehavior,
@@ -1334,20 +1423,41 @@ async function configureModelRoutes(
   options: ChooseModelOptions & { targetMode: ModelTargetMode },
 ): Promise<string[]> {
   const updates: string[] = [];
+  const targetRoutes: ModelTargetRoutes = {
+    ...(routing.provider || routing.model
+      ? {
+          "session-default": {
+            ...(routing.provider ? { provider: routing.provider } : {}),
+            ...(routing.model ? { model: routing.model } : {}),
+          },
+        }
+      : {}),
+    ...Object.fromEntries(
+      Object.entries(routing.roleRoutes).map(([role, route]) => [
+        role,
+        { ...route },
+      ]),
+    ),
+  };
   const selected = await chooseModel(runtime, cwd, {
     ...options,
+    targetRoutes,
     continueAfterTargetAssignment: true,
     async onTargetAssigned(assignment) {
-      const message = applySelectedModel(
-        routing,
-        assignment,
-        assignment.target,
-      );
       await runtime.config.saveUserModelRoute(
         assignment.target,
         assignment.provider,
         assignment.model,
       );
+      const message = applySelectedModel(
+        routing,
+        assignment,
+        assignment.target,
+      );
+      targetRoutes[assignment.target] = {
+        provider: assignment.provider,
+        model: assignment.model,
+      };
       updates.push(message);
       return message;
     },

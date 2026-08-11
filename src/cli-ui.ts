@@ -809,6 +809,7 @@ export interface FollowupSelectOptions<T> {
   title: string;
   items: readonly SelectItem<T>[];
   initialValue?: T;
+  assignedValues?: readonly T[];
   emptyMessage?: string;
 }
 
@@ -1102,7 +1103,7 @@ async function selectProviderModelFlow<T, U>(
     let chosenProviderLabel = "";
     let lastAssignment = "";
     let renderedLines: string[] = [];
-    const assignedTargets = new Set<U>();
+    const assignedTargets = new Set<U>(followup?.assignedValues ?? []);
     let targetIndex = Math.max(
       0,
       followup?.items.findIndex((item) =>

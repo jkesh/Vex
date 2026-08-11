@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -434,12 +434,13 @@ async function loadLayers(
   const candidates: string[] = [];
   const user = await firstConfig(path.join(home, ".vex"));
   if (user) candidates.push(user);
-  const userRouting = path.join(home, ".vex", "routing.json");
-  if (await exists(userRouting)) candidates.push(userRouting);
   if (projectTrusted) {
     const project = await firstConfig(path.join(root, ".vex"));
     if (project) candidates.push(project);
   }
+  // Explicit interactive choices are user preferences and override project defaults.
+  const userRouting = path.join(home, ".vex", "routing.json");
+  if (await exists(userRouting)) candidates.push(userRouting);
   if (environment.VEX_CONFIG) {
     const explicit = path.resolve(environment.VEX_CONFIG);
     if (!(await exists(explicit))) throw new Error(`VEX_CONFIG not found: ${explicit}`);
@@ -689,11 +690,13 @@ export class VexConfigLoader {
     }
     const validated = validateConfig(next, filePath);
     await mkdir(path.dirname(filePath), { recursive: true });
+    const temporary = `${filePath}.${process.pid}.tmp`;
     await writeFile(
-      filePath,
+      temporary,
       `${JSON.stringify(validated, null, 2)}\n`,
       "utf8",
     );
+    await rename(temporary, filePath);
     return filePath;
   }
 

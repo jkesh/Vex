@@ -8,6 +8,7 @@ import {
   createInteractiveHintProvider,
   interactiveHelp,
   isDirectExecution,
+  modelTargetItems,
   parseCliArguments,
   parseInteractiveInput,
 } from "../src/cli.js";
@@ -364,6 +365,26 @@ describe("standalone CLI argument parser", () => {
     expect(selectorVisibleRows(24)).toBe(14);
     expect(selectorVisibleRows(12)).toBe(4);
     expect(selectorVisibleRows(6)).toBe(1);
+  });
+
+  test("restores saved model assignments in the target selector", () => {
+    const routes = {
+      "session-default": {
+        provider: "deepseek",
+        model: "deepseek-v4-flash",
+      },
+      reviewer: {
+        provider: "anthropic",
+        model: "claude-sonnet-4-5",
+      },
+    } as const;
+    const items = modelTargetItems(true, routes);
+    expect(items.find((item) => item.value === "session-default")?.description)
+      .toContain("current deepseek/deepseek-v4-flash");
+    expect(items.find((item) => item.value === "reviewer")?.description)
+      .toContain("current anthropic/claude-sonnet-4-5");
+    expect(items.find((item) => item.value === "backend")?.description)
+      .toContain("inherits deepseek/deepseek-v4-flash");
   });
 
   test("recognizes execution through an npm-style directory link", async () => {

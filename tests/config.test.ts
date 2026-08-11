@@ -192,10 +192,24 @@ describe("independent VEX configuration", () => {
       },
     });
 
+    await mkdir(path.join(root, ".vex"), { recursive: true });
+    const projectConfig = path.join(root, ".vex", "config.json");
+    await writeFile(
+      projectConfig,
+      JSON.stringify({
+        defaultProvider: "openai",
+        defaultModel: "project-default",
+        agents: {
+          reviewer: { provider: "openai", model: "project-reviewer" },
+        },
+      }),
+      "utf8",
+    );
+
     const resolved = await new VexConfigLoader({
       homeDirectory: home,
       environment: {},
-    }).resolve(root, undefined, false);
+    }).resolve(root, undefined, true);
     expect(resolved.agents.backend).toMatchObject({
       provider: "deepseek",
       model: "deepseek-v4-flash",
@@ -205,6 +219,9 @@ describe("independent VEX configuration", () => {
       model: "claude-sonnet-4-5",
     });
     expect(resolved.sources).toContain(routingPath);
+    expect(resolved.sources.indexOf(routingPath)).toBeGreaterThan(
+      resolved.sources.indexOf(projectConfig),
+    );
   });
 
   test("provides Claude natively and accepts OpenAI-compatible gateways", async () => {
