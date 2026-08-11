@@ -81,7 +81,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function normalizeBaseUrl(value: unknown, location: string): string {
+export function normalizeBaseUrl(value: unknown, location: string): string {
   if (typeof value !== "string") throw new Error(`${location} must be a URL`);
   let url: URL;
   try {
@@ -439,6 +439,8 @@ async function loadLayers(
     if (project) candidates.push(project);
   }
   // Explicit interactive choices are user preferences and override project defaults.
+  const userProviders = path.join(home, ".vex", "providers.json");
+  if (await exists(userProviders)) candidates.push(userProviders);
   const userRouting = path.join(home, ".vex", "routing.json");
   if (await exists(userRouting)) candidates.push(userRouting);
   if (environment.VEX_CONFIG) {
@@ -625,6 +627,56 @@ export class VexConfigLoader {
     );
   }
 
+  #providersPath(): string {
+    return path.join(
+      this.#options.homeDirectory ?? os.homedir(),
+      ".vex",
+      "providers.json",
+    );
+  }
+
+  async #writeUserConfig(
+    filePath: string,
+    config: VexConfigInput,
+  ): Promise<void> {
+    await mkdir(path.dirname(filePath), { recursive: true });
+    const temporary = `${filePath}.${process.pid}.tmp`;
+    await writeFile(
+      temporary,
+      `${JSON.stringify(config, null, 2)}\n`,
+      "utf8",
+    );
+    await rename(temporary, filePath);
+  }
+
+  async userProviders(): Promise<Record<string, ProviderConfigInput>> {
+    const target = this.#providersPath();
+    if (!(await exists(target))) return {};
+    return (await loadFile(target)).providers ?? {};
+  }
+
+  async saveUserProvider(
+    providerId: string,
+    profile: ProviderConfigInput,
+  ): Promise<string> {
+    const id = providerId.trim().toLowerCase();
+    if (!/^[a-z0-9][a-z0-9._-]*$/i.test(id)) {
+      throw new Error(`Invalid Provider ID: ${providerId}`);
+    }
+    const filePath = this.#providersPath();
+    const validated = validateConfig(
+      {
+        providers: {
+          ...(await this.userProviders()),
+          [id]: profile,
+        },
+      },
+      filePath,
+    );
+    await this.#writeUserConfig(filePath, validated);
+    return filePath;
+  }
+
   async userRouting(): Promise<VexUserRouting> {
     const target = this.#routingPath();
     if (!(await exists(target))) return { agents: {} };
@@ -689,14 +741,7 @@ export class VexConfigLoader {
       };
     }
     const validated = validateConfig(next, filePath);
-    await mkdir(path.dirname(filePath), { recursive: true });
-    const temporary = `${filePath}.${process.pid}.tmp`;
-    await writeFile(
-      temporary,
-      `${JSON.stringify(validated, null, 2)}\n`,
-      "utf8",
-    );
-    await rename(temporary, filePath);
+    await this.#writeUserConfig(filePath, validated);
     return filePath;
   }
 

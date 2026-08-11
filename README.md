@@ -207,13 +207,16 @@ model defaults but remain below process and command-line overrides:
 /provider                        select a Provider; authenticate when required
 /provider openai oauth           ChatGPT browser OAuth; no API key entry
 /provider openai api-key         paste an existing OpenAI API key
+/provider add newapi             add an OpenAI-compatible custom endpoint
+/provider add sub2api            add a native Messages custom endpoint
+/provider newapi setup           change a saved endpoint or API key
 /model [query]                   repeatedly choose model and target; Esc finishes
 /route                           repeatedly choose model and Agent role; Esc finishes
 /route architect openai reasoning-model   direct form
 /routing
 ```
 
-`/provider` is the only interactive Provider command. With no argument it opens the Provider selector; with an ID it selects that Provider and authenticates only when required. For OpenAI, **Sign in with ChatGPT** starts OAuth with PKCE, opens `auth.openai.com`, waits on `http://localhost:1455/auth/callback`, validates the returned state, exchanges the authorization code, and saves the resulting OAuth session. Nothing is pasted into the terminal. The direct `api-key` method remains available through `/provider openai api-key`.
+`/provider` is the only interactive Provider command. With no argument it opens the Provider selector, which includes actions for adding NewAPI and Sub2API endpoints; with an ID it selects that Provider and authenticates only when required. `/provider add newapi` and `/provider add sub2api` run the same setup directly. The wizard accepts a custom Provider ID, complete base URL (including a prefix such as `/v1`), and a hidden API-key entry. Endpoint and protocol metadata are atomically stored in `~/.vex/providers.json`; the key is stored separately in `~/.vex/auth.json`. Re-run `/provider <id> setup` to change either value, leaving the key empty to retain the saved credential. For OpenAI, **Sign in with ChatGPT** starts OAuth with PKCE, opens `auth.openai.com`, waits on `http://localhost:1455/auth/callback`, validates the returned state, exchanges the authorization code, and saves the resulting OAuth session. Nothing is pasted into the terminal. The direct `api-key` method remains available through `/provider openai api-key`.
 
 ChatGPT OAuth and Platform API-key authentication are separate request paths. OAuth uses the public Codex OAuth flow and sends OpenAI requests to the ChatGPT Codex Responses backend with the selected ChatGPT account; API keys continue to use the configured Platform-compatible endpoint. VEX implements this flow itself and does not invoke OpenCode/Codex or import either application's credential cache. Access, refresh, and ID tokens are stored only in `~/.vex/auth.json`, refreshed automatically before expiry, and protected with user-only file permissions where the operating system supports them. Treat that file as a secret. Keyless Providers such as Ollama need no credential, environment credentials are detected, and `/logout` removes only credentials saved by VEX.
 
@@ -228,7 +231,7 @@ VEX selects transport from the Provider profile rather than from a hard-coded ve
 
 The independent `modelCatalog` setting defines discovery: `openai` calls `GET <baseUrl>/models` and reads every `data[].id`; `anthropic` calls the same resource with `after_id` pagination and native Anthropic headers. It defaults from `protocol`, but can be overridden—for example, a Sub2API profile can generate through native Messages while listing models through its OpenAI-compatible catalog. `VEX_OPENAI_CODEX_CLIENT_VERSION` is an advanced override for the ChatGPT catalog capability query; it is intentionally separate from the VEX package version.
 
-OpenAI ChatGPT OAuth is the one intentional exception: it discovers and runs Codex models through the authenticated ChatGPT backend. The built-in profiles cover OpenAI, Anthropic, DeepSeek, OpenRouter, and Ollama. NewAPI and Sub2API are deployment-specific, so configure their own `baseUrl`; use `openai-chat-completions` for their OpenAI-compatible entrance or `anthropic-messages` when the gateway exposes native Claude Messages. No VEX adapter code is copied from those projects.
+OpenAI ChatGPT OAuth is the one intentional exception: it discovers and runs Codex models through the authenticated ChatGPT backend. The built-in profiles cover OpenAI, Anthropic, DeepSeek, OpenRouter, and Ollama. NewAPI setup creates an `openai-chat-completions` profile with an OpenAI model catalog. Sub2API setup creates an `anthropic-messages` profile while retaining the gateway's OpenAI-compatible model catalog. Both accept deployment-specific URLs and credentials; no VEX adapter code is copied from those projects.
 
 ### Network proxy
 

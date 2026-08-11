@@ -224,6 +224,62 @@ describe("independent VEX configuration", () => {
     );
   });
 
+  test("persists custom gateway endpoints without API keys", async () => {
+    const { home, root } = await fixture();
+    const loader = new VexConfigLoader({
+      homeDirectory: home,
+      environment: {},
+    });
+
+    const providersPath = await loader.saveUserProvider("newapi-work", {
+      protocol: "openai-chat-completions",
+      modelCatalog: "openai",
+      baseUrl: "https://newapi.example/v1/",
+      requiresAuth: true,
+    });
+    await loader.saveUserProvider("sub2api-work", {
+      protocol: "anthropic-messages",
+      modelCatalog: "openai",
+      baseUrl: "https://sub2api.example/v1",
+      requiresAuth: true,
+    });
+
+    expect(providersPath).toBe(path.join(home, ".vex", "providers.json"));
+    const saved = JSON.parse(await readFile(providersPath, "utf8"));
+    expect(saved).toEqual({
+      providers: {
+        "newapi-work": {
+          protocol: "openai-chat-completions",
+          modelCatalog: "openai",
+          baseUrl: "https://newapi.example/v1",
+          requiresAuth: true,
+        },
+        "sub2api-work": {
+          protocol: "anthropic-messages",
+          modelCatalog: "openai",
+          baseUrl: "https://sub2api.example/v1",
+          requiresAuth: true,
+        },
+      },
+    });
+    expect(JSON.stringify(saved)).not.toContain("apiKey");
+
+    const profiles = await new VexConfigLoader({
+      homeDirectory: home,
+      environment: {},
+    }).listProviders(root, false);
+    expect(profiles.providers["newapi-work"]).toMatchObject({
+      protocol: "openai-chat-completions",
+      modelCatalog: "openai",
+      baseUrl: "https://newapi.example/v1",
+    });
+    expect(profiles.providers["sub2api-work"]).toMatchObject({
+      protocol: "anthropic-messages",
+      modelCatalog: "openai",
+      baseUrl: "https://sub2api.example/v1",
+    });
+  });
+
   test("provides Claude natively and accepts OpenAI-compatible gateways", async () => {
     const { home, root } = await fixture();
     const loader = new VexConfigLoader({

@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import {
   createInteractiveCompleter,
   createInteractiveHintProvider,
+  customProviderProfile,
   interactiveHelp,
   isDirectExecution,
   modelTargetItems,
@@ -166,6 +167,11 @@ describe("standalone CLI argument parser", () => {
       provider: "openai",
       method: "oauth",
     });
+    expect(parseInteractiveInput("/provider add newapi")).toEqual({
+      kind: "set-provider",
+      provider: "add",
+      method: "newapi",
+    });
     expect(parseInteractiveInput("/model gpt-coder")).toEqual({
       kind: "set-model",
       model: "gpt-coder",
@@ -236,7 +242,15 @@ describe("standalone CLI argument parser", () => {
       "/provider openai oauth",
     ]);
     expect(complete("/login")[0]).toEqual([]);
-    expect(interactiveHelp()).toContain("/provider [id] [oauth|api-key]");
+    expect(complete("/provider add n")[0]).toEqual([
+      "/provider add newapi",
+    ]);
+    expect(complete("/provider sub2api s")[0]).toEqual([
+      "/provider sub2api setup",
+    ]);
+    expect(interactiveHelp()).toContain(
+      "/provider [id] [oauth|api-key|setup]",
+    );
     expect(interactiveHelp()).toContain(
       "assign models to targets repeatedly; Esc finishes",
     );
@@ -385,6 +399,23 @@ describe("standalone CLI argument parser", () => {
       .toContain("current anthropic/claude-sonnet-4-5");
     expect(items.find((item) => item.value === "backend")?.description)
       .toContain("inherits deepseek/deepseek-v4-flash");
+  });
+
+  test("maps NewAPI and Sub2API to their compatible wire formats", () => {
+    expect(customProviderProfile("newapi", "https://new.example/v1"))
+      .toEqual({
+        protocol: "openai-chat-completions",
+        modelCatalog: "openai",
+        baseUrl: "https://new.example/v1",
+        requiresAuth: true,
+      });
+    expect(customProviderProfile("sub2api", "https://sub.example/v1"))
+      .toEqual({
+        protocol: "anthropic-messages",
+        modelCatalog: "openai",
+        baseUrl: "https://sub.example/v1",
+        requiresAuth: true,
+      });
   });
 
   test("recognizes execution through an npm-style directory link", async () => {

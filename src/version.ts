@@ -1,1 +1,1 @@
-export const VEX_VERSION = "0.8.3";
+export const VEX_VERSION = "0.9.0";

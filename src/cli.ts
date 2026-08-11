@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  ask,
   chatPrompt,
   clearAndRender,
   confirm,
@@ -35,7 +36,9 @@ import {
 } from "./defaults.js";
 import {
   formatResolvedConfig,
+  normalizeBaseUrl,
   VexConfigLoader,
+  type ProviderConfigInput,
 } from "./config.js";
 import {
   NoopKnowledgeProvider,
@@ -369,8 +372,8 @@ Type / for live command hints. Use Up/Down to choose and Tab to complete command
   /config            show provider and role routing
   /providers         list Provider profiles and login status
   /models [provider] open the two-pane Provider/model selector
-  /provider [id] [oauth|api-key]
-                     select a Provider and connect it when required
+  /provider [id] [oauth|api-key|setup]
+                     connect a Provider; add/configure NewAPI or Sub2API
   /logout [provider] select and remove a saved login
   /model [query]     assign models to targets repeatedly; Esc finishes
   /route [role] [provider] [model]
@@ -508,15 +511,30 @@ export function createInteractiveCompleter(
       candidates = context.providers.map((provider) => `${command} ${provider}`);
     } else if (command === "/provider") {
       if (parts.length === 0 || (parts.length === 1 && !endsWithSpace)) {
-        candidates = context.providers.map(
+        candidates = [...new Set([
+          ...context.providers,
+          ...CUSTOM_PROVIDER_FORMATS,
+          "add",
+        ])].map(
           (provider) => `${command} ${provider} `,
         );
       } else {
         const provider = parts[0]!;
-        candidates = [
-          `${command} ${provider} api-key`,
-          ...(provider === "openai" ? [`${command} ${provider} oauth`] : []),
-        ];
+        candidates = provider === "add"
+          ? CUSTOM_PROVIDER_FORMATS.map(
+            (format) => `${command} add ${format}`,
+          )
+          : [
+              `${command} ${provider} api-key`,
+              ...(provider === "openai"
+                ? [`${command} ${provider} oauth`]
+                : []),
+              ...(CUSTOM_PROVIDER_FORMATS.includes(
+                  provider as CustomProviderFormat,
+                )
+                ? [`${command} ${provider} setup`]
+                : []),
+            ];
       }
     } else if (command === "/model") {
       candidates = context.models.map(({ model }) => `/model ${model}`);
@@ -557,7 +575,14 @@ function describeInteractiveHint(
   if (command === "/provider") {
     if (arguments_.length === 1) {
       const provider = arguments_[0]!;
+      if (provider === "add") return "add a custom NewAPI or Sub2API endpoint";
       return `${PROVIDER_NAMES[provider] ?? provider} Provider`;
+    }
+    if (arguments_[0] === "add") {
+      return `configure a custom ${PROVIDER_NAMES[arguments_[1]!] ?? arguments_[1]} endpoint and API key`;
+    }
+    if (arguments_[1] === "setup") {
+      return "change the custom endpoint and API key";
     }
     return arguments_[1] === "oauth"
       ? "browser authorization; no API key required"
@@ -687,8 +712,10 @@ Usage:
   vex cleanup [run-id]        remove retained worktrees
   vex config                  show provider and role routing
   vex providers               list Provider profiles and auth status
-  vex provider [id] [oauth|api-key]
-                              select and connect a Provider
+  vex provider [id] [oauth|api-key|setup]
+                              connect a Provider; add/configure gateway formats
+  vex provider add [newapi|sub2api]
+                              save a custom endpoint and API key
   vex models [provider]       list every connected catalog, or one Provider
   vex logout [provider]       select and remove a saved login
   vex init [--global]         create an independent VEX config
@@ -766,6 +793,7 @@ interface InteractiveRoutingState {
 
 type ProviderAuthState = "keyless" | "environment" | "saved" | "missing";
 type ProviderLoginMethod = "oauth" | "api-key";
+export type CustomProviderFormat = "newapi" | "sub2api";
 
 interface ProviderEntry {
   provider: ProviderRuntimeConfig;
@@ -780,7 +808,32 @@ const PROVIDER_NAMES: Record<string, string> = {
   anthropic: "Claude (Anthropic)",
   deepseek: "DeepSeek",
   ollama: "Ollama",
+  newapi: "NewAPI",
+  sub2api: "Sub2API",
 };
+
+const CUSTOM_PROVIDER_FORMATS = ["newapi", "sub2api"] as const;
+const CUSTOM_PROVIDER_SELECTION_PREFIX = "vex:add-provider:";
+
+export function customProviderProfile(
+  format: CustomProviderFormat,
+  baseUrl: string,
+): ProviderConfigInput {
+  if (format === "sub2api") {
+    return {
+      protocol: "anthropic-messages",
+      modelCatalog: "openai",
+      baseUrl,
+      requiresAuth: true,
+    };
+  }
+  return {
+    protocol: "openai-chat-completions",
+    modelCatalog: "openai",
+    baseUrl,
+    requiresAuth: true,
+  };
+}
 
 const ROLE_DESCRIPTIONS: Record<ModelRole, string> = {
   scout: "repository discovery and context",
@@ -868,6 +921,7 @@ async function chooseProvider(
   cwd: string,
   title: string,
   initial?: string,
+  includeCustomSetup = false,
 ): Promise<string | undefined> {
   const entries = await providerEntries(runtime, cwd);
   const items: SelectItem<string>[] = entries.map((entry) => {
@@ -883,6 +937,22 @@ async function chooseProvider(
       keywords: [entry.provider.id, entry.provider.baseUrl],
     };
   });
+  if (includeCustomSetup) {
+    items.push(
+      {
+        value: `${CUSTOM_PROVIDER_SELECTION_PREFIX}newapi`,
+        label: "+ Add NewAPI endpoint",
+        description: "custom base URL and API key · OpenAI-compatible API",
+        keywords: ["add", "custom", "newapi", "gateway"],
+      },
+      {
+        value: `${CUSTOM_PROVIDER_SELECTION_PREFIX}sub2api`,
+        label: "+ Add Sub2API endpoint",
+        description: "custom base URL and API key · native Anthropic Messages",
+        keywords: ["add", "custom", "sub2api", "gateway", "anthropic"],
+      },
+    );
+  }
   const initialValue =
     initial && items.some((item) => item.value === initial)
       ? initial
@@ -891,6 +961,94 @@ async function chooseProvider(
     ...(initialValue ? { initialValue } : {}),
     emptyMessage: "No Provider matches this search",
   });
+}
+
+async function chooseCustomProviderFormat(
+  initial?: string,
+): Promise<CustomProviderFormat | undefined> {
+  return selectItem<CustomProviderFormat>(
+    "Choose the compatible API format",
+    [
+      {
+        value: "newapi",
+        label: "NewAPI",
+        description: "OpenAI Chat Completions and GET /models",
+        keywords: ["newapi", "openai", "chat", "completions"],
+      },
+      {
+        value: "sub2api",
+        label: "Sub2API",
+        description: "Anthropic Messages with an OpenAI-compatible model catalog",
+        keywords: ["sub2api", "anthropic", "messages", "claude"],
+      },
+    ],
+    {
+      ...(CUSTOM_PROVIDER_FORMATS.includes(initial as CustomProviderFormat)
+        ? { initialValue: initial as CustomProviderFormat }
+        : {}),
+    },
+  );
+}
+
+async function configureCustomProvider(
+  runtime: Runtime,
+  cwd: string,
+  requestedFormat?: string,
+  initialId?: string,
+): Promise<string | undefined> {
+  const normalizedFormat = requestedFormat?.trim().toLowerCase();
+  const format = CUSTOM_PROVIDER_FORMATS.includes(
+      normalizedFormat as CustomProviderFormat,
+    )
+    ? normalizedFormat as CustomProviderFormat
+    : await chooseCustomProviderFormat(normalizedFormat);
+  if (!format) return undefined;
+
+  const suggestedId = initialId?.trim().toLowerCase() || format;
+  const enteredId = await ask(`Provider ID [${suggestedId}]`);
+  const providerId = (enteredId || suggestedId).trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9._-]*$/.test(providerId)) {
+    throw new Error(
+      "Provider ID must start with a letter or number and contain only letters, numbers, dots, underscores, or dashes.",
+    );
+  }
+
+  const root = await runtime.worktrees.resolveWorkspaceRoot(cwd);
+  const existing = (await runtime.config.listProviders(root, false))
+    .providers[providerId];
+  const enteredBaseUrl = await ask(
+    `Base URL including the API prefix${existing?.baseUrl ? ` [${existing.baseUrl}]` : " (for example https://gateway.example/v1)"}`,
+  );
+  const requestedBaseUrl = enteredBaseUrl.trim() || existing?.baseUrl;
+  if (!requestedBaseUrl) {
+    process.stdout.write("Provider setup cancelled; a base URL is required.\n");
+    return undefined;
+  }
+  const baseUrl = normalizeBaseUrl(
+    requestedBaseUrl,
+    `Provider ${providerId} base URL`,
+  );
+
+  const existingApiKey = await runtime.auth.getApiKey(providerId);
+  const apiKey = await readSecret(
+    existingApiKey
+      ? `API key for ${providerId} (leave empty to keep the saved key)`
+      : `API key for ${providerId}`,
+  );
+  if (!apiKey && !existingApiKey) {
+    process.stdout.write("Provider setup cancelled; an API key is required.\n");
+    return undefined;
+  }
+
+  const profilePath = await runtime.config.saveUserProvider(
+    providerId,
+    customProviderProfile(format, baseUrl),
+  );
+  if (apiKey) await runtime.auth.login(providerId, apiKey, "manual");
+  process.stdout.write(
+    `Connected ${providerId} using the ${format} format. Endpoint saved in ${profilePath}; API key saved separately in the VEX auth store.\n`,
+  );
+  return providerId;
 }
 
 function setSessionProvider(
@@ -935,8 +1093,43 @@ async function loginToProvider(
   requestedMethod?: string,
 ): Promise<string | undefined> {
   const providerId = requestedProvider?.trim().toLowerCase() ||
-    await chooseProvider(runtime, cwd, "Choose a Provider");
+    await chooseProvider(runtime, cwd, "Choose a Provider", undefined, true);
+  const normalizedMethod = requestedMethod?.trim().toLowerCase();
   if (!providerId) return undefined;
+  if (providerId.startsWith(CUSTOM_PROVIDER_SELECTION_PREFIX)) {
+    return configureCustomProvider(
+      runtime,
+      cwd,
+      providerId.slice(CUSTOM_PROVIDER_SELECTION_PREFIX.length),
+    );
+  }
+  if (providerId === "add") {
+    if (
+      normalizedMethod &&
+      !CUSTOM_PROVIDER_FORMATS.includes(normalizedMethod as CustomProviderFormat)
+    ) {
+      throw new Error("Unknown custom Provider format. Use newapi or sub2api.");
+    }
+    return configureCustomProvider(runtime, cwd, normalizedMethod);
+  }
+  const existingEntry = (await providerEntries(runtime, cwd)).find(
+    (candidate) => candidate.provider.id === providerId,
+  );
+  if (
+    normalizedMethod === "setup" ||
+    (!existingEntry && CUSTOM_PROVIDER_FORMATS.includes(
+      providerId as CustomProviderFormat,
+    ))
+  ) {
+    return configureCustomProvider(
+      runtime,
+      cwd,
+      CUSTOM_PROVIDER_FORMATS.includes(providerId as CustomProviderFormat)
+        ? providerId
+        : undefined,
+      providerId,
+    );
+  }
   const entry = await requireProviderEntry(runtime, cwd, providerId);
   if (entry.auth === "keyless") {
     process.stdout.write(
@@ -1646,25 +1839,25 @@ async function interactive(runtime: Runtime, cwd: string): Promise<void> {
     }
     if (action.kind === "set-provider") {
       try {
-        const provider = action.provider ||
-          await chooseProvider(
-            runtime,
-            cwd,
-            "Choose the default Provider",
-            routing.provider,
+        const requestedProvider = action.provider || await chooseProvider(
+          runtime,
+          cwd,
+          "Choose the default Provider",
+          routing.provider,
+          true,
         );
-        if (!provider) continue;
-        const entry = await requireProviderEntry(runtime, cwd, provider);
-        const selectedProvider = action.method || entry.auth === "missing"
-          ? await loginToProvider(
-              runtime,
-              cwd,
-              provider,
-              action.method || undefined,
-            )
-          : provider;
+        if (!requestedProvider) continue;
+        const selectedProvider = await loginToProvider(
+          runtime,
+          cwd,
+          requestedProvider,
+          action.method || undefined,
+        );
         if (!selectedProvider) continue;
         setSessionProvider(routing, selectedProvider);
+        completionContext.providers = (await providerEntries(runtime, cwd)).map(
+          (entry) => entry.provider.id,
+        );
         process.stdout.write(`Session Provider: ${selectedProvider}\n`);
       } catch (error) {
         process.stdout.write(
